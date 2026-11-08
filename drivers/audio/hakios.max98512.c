@@ -390,16 +390,33 @@ write_checked(const struct amp *a, uint16_t reg, uint8_t value, uint8_t check, b
 	if (broken && !even_broken) {
 		return false;
 	}
-	error = raw_write(a, at, value);
+	uint32_t write_error;
+
+	error = write_error = raw_write(a, at, value);
 	if (r->check == 0) {
 		return true;                    /* SOFT_RESET: it clears itself; reset() looks whether it took */
 	}
 	if (error == 0) {
 		error = raw_read(a, at, &back);
 	}
+	/* The global enable starts the chip's boost, and the chip may not answer on the bus for a few ms meanwhile (the
+	   Note9's top amplifier: 0x400 on the read back, at once): asked again every 2 ms, for 20 ms, before it is given up. */
+	for (unsigned i = 0; reg == GLOBAL_SHDN && i < 10 && (error != 0 || ((back ^ value) & check & r->check) != 0); i++) {
+		uint64_t until = deadline_us(2000);
+
+		while (mach_absolute_time() < until) {
+		}
+		if (write_error != 0) {
+			error = write_error = raw_write(a, at, value);
+			if (error != 0) {
+				continue;
+			}
+		}
+		error = raw_read(a, at, &back);
+	}
 	if (error != 0 || ((back ^ value) & check & r->check) != 0) {
-		say("max98512: %s (%#x): register %#x (%#x in the chip): wrote %#x, read back %#x (bus %#x): no more writing "
-		    "for this run\n", a->name, a->addr, reg, at, value, back, error);
+		say("max98512: %s (%#x): register %#x (%#x in the chip): wrote %#x (bus %#x), read back %#x (bus %#x): no more "
+		    "writing for this run\n", a->name, a->addr, reg, at, value, write_error, back, error);
 		broken = true;
 		return false;
 	}
