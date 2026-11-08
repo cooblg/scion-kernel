@@ -132,6 +132,12 @@ drmIoctl(int fd, unsigned long request, void *arg)
 		error = submit(arg);
 	} else if (opened == PANFROST && number == DRM_COMMAND_BASE + DRM_PANFROST_WAIT_BO) {
 		error = wait_buffer(arg);
+	} else if (opened == PANFROST && number == DRM_COMMAND_BASE + DRM_PANFROST_MADVISE) {
+		/* HakiosMali's answer to this is always "retained" and nothing else (hakios.mali.cpp, kPanfrostMadvise);
+		   Mesa makes a buffer evictable and unevictable around every use from its cache, each a round trip
+		   to the kernel (a third of the window server's drawing thread in glprof) */
+		((struct drm_panfrost_madvise *)arg)->retained = 1;
+		error = 0;
 	} else {
 		error = call(number, arg, IOCPARM_LEN(request));
 	}
