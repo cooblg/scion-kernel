@@ -1,0 +1,36 @@
+--- a/src/gallium/drivers/panfrost/pan_bo.c	2026-11-08 22:33:33
++++ b/src/gallium/drivers/panfrost/pan_bo.c	2026-11-08 22:33:41
+@@ -121,9 +121,21 @@
+    return NULL;
+ }
+ 
++static void panfrost_bo_munmap(struct panfrost_bo *bo);
++
++#ifdef __APPLE__
++/* boot-arg bo_keepmap=1: a BO that goes to the cache keeps its CPU mapping, and comes out with it (every
++ * mapping and unmapping is a round trip to the kernel's driver: hakios.drm.c) */
++extern int hakios_drm_keep_maps(void);
++#endif
++
+ static void
+ panfrost_bo_free(struct panfrost_bo *bo)
+ {
++#ifdef __APPLE__
++   /* (a BO in the cache may still be mapped) */
++   panfrost_bo_munmap(bo);
++#endif
+    struct pan_kmod_bo *kmod_bo = bo->kmod_bo;
+    struct pan_kmod_vm *vm = bo->dev->kmod.vm;
+    uint64_t gpu_va = bo->ptr.gpu;
+@@ -465,7 +477,10 @@
+     */
+    if (p_atomic_read(&bo->refcnt) == 0) {
+       /* When the reference count goes to zero, we need to cleanup */
+-      panfrost_bo_munmap(bo);
++#ifdef __APPLE__
++      if (!hakios_drm_keep_maps())
++#endif
++         panfrost_bo_munmap(bo);
+ 
+       if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC))
+          pandecode_inject_free(dev->decode_ctx, bo->ptr.gpu,

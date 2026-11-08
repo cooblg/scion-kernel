@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #include <IOKit/IOKitLib.h>
@@ -212,6 +213,22 @@ drmCloseBufferHandle(int fd, uint32_t handle)
 	struct drm_gem_close request = { .handle = handle };
 
 	return drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &request);
+}
+
+/* Boot-arg bo_keepmap=1: Mesa's buffer cache keeps a buffer's CPU mapping while the buffer waits in it
+   (pan_bo.c, panfrost-keepmap.patch), so the next use needs no map call to the kernel's driver. */
+int
+hakios_drm_keep_maps(void)
+{
+	static int keep = -1;
+
+	if (keep < 0) {
+		char arguments[1024] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		keep = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "bo_keepmap=1") != NULL;
+	}
+	return keep;
 }
 
 void *
