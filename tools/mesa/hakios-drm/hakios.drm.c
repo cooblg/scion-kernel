@@ -120,6 +120,11 @@ call(unsigned number, void *data, size_t size)
 }
 
 static int submit(struct drm_panfrost_submit *request);
+
+/* bo_fastwait (below, with submit()): what is known of each buffer's last job */
+enum { TRACK_NONE = 0, TRACK_BUFFER = 1, TRACK_ASK = 2 };
+static int fast_wait_on(void);
+static void track_set(uint32_t handle, int state);
 static int wait_buffer(struct drm_panfrost_wait_bo *request);
 
 int
@@ -140,7 +145,13 @@ drmIoctl(int fd, unsigned long request, void *arg)
 		((struct drm_panfrost_madvise *)arg)->retained = 1;
 		error = 0;
 	} else {
+		if (opened == PANFROST && request == DRM_IOCTL_GEM_CLOSE && fast_wait_on()) {
+			track_set(((struct drm_gem_close *)arg)->handle, TRACK_NONE);
+		}
 		error = call(number, arg, IOCPARM_LEN(request));
+		if (error == 0 && opened == PANFROST && number == DRM_COMMAND_BASE + DRM_PANFROST_CREATE_BO && fast_wait_on()) {
+			track_set(((struct drm_panfrost_create_bo *)arg)->handle, TRACK_BUFFER);
+		}
 	}
 	if (error != 0) {
 		errno = error;
@@ -215,18 +226,25 @@ drmCloseBufferHandle(int fd, uint32_t handle)
 	return drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &request);
 }
 
-/* Boot-arg bo_keepmap=1: Mesa's buffer cache keeps a buffer's CPU mapping while the buffer waits in it
-   (pan_bo.c, panfrost-keepmap.patch), so the next use needs no map call to the kernel's driver. */
+/* Boot-args read once from kern.bootargs: bo_keepmap=1 (Mesa's buffer cache keeps a buffer's CPU mapping
+   while the buffer waits in it: pan_bo.c, panfrost-keepmap.patch, so the next use needs no map call to the
+   kernel's driver) and bo_fastwait=1 (see wait_buffer()). */
+static int
+boot_flag(const char *flag)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+
+	return sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, flag) != NULL;
+}
+
 int
 hakios_drm_keep_maps(void)
 {
 	static int keep = -1;
 
 	if (keep < 0) {
-		char arguments[1024] = "";
-		size_t size = sizeof(arguments) - 1;
-
-		keep = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "bo_keepmap=1") != NULL;
+		keep = boot_flag("bo_keepmap=1");
 	}
 	return keep;
 }
@@ -284,6 +302,9 @@ drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
 		return -1;
 	}
 	*handle = request.handle;
+	if (opened == PANFROST && fast_wait_on()) {
+		track_set(request.handle, TRACK_ASK);
+	}
 	return 0;
 }
 
@@ -358,6 +379,75 @@ wait_job(uint64_t seq, int64_t deadline)
 static uint64_t *syncobj(uint32_t handle);
 
 /*
+ * boot-arg bo_fastwait=1: which job last named each buffer, kept here as the kernel keeps it (every submit
+ * names its buffers: bo_handles), so that "is the GPU done with this buffer" is answered without a round
+ * trip to the kernel whenever this process already knows that job is done (`finished`). Only the answer
+ * "done" is ever given from here, and only when it is certain: a buffer made by CREATE_BO that no job has
+ * named is done (the kernel says so too, its job number being 0), and so is one whose last job is not later
+ * than a job known to be done. Everything else -- a buffer this table does not know, one that came in as a
+ * surface (the kernel flushes its lines when it says "done") -- is asked of the kernel as ever.
+ */
+struct tracked {
+	uint64_t job;
+	uint8_t state;
+};
+#define TRACK_MAX 65536
+static struct tracked *tracked;
+static uint32_t tracked_count;
+
+static int
+fast_wait_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		on = boot_flag("bo_fastwait=1");
+	}
+	return on;
+}
+
+/* (with the lock held) the buffer's entry, made if need be; NULL: a handle too large to be kept */
+static struct tracked *
+track(uint32_t handle, bool make)
+{
+	if (handle == 0 || handle >= TRACK_MAX) {
+		return NULL;
+	}
+	if (handle >= tracked_count) {
+		uint32_t count = tracked_count != 0 ? tracked_count : 256;
+		struct tracked *grown;
+
+		if (!make) {
+			return NULL;
+		}
+		while (count <= handle) {
+			count *= 2;
+		}
+		grown = realloc(tracked, count * sizeof(*grown));
+		if (grown == NULL) {
+			return NULL;
+		}
+		memset(grown + tracked_count, 0, (count - tracked_count) * sizeof(*grown));
+		tracked = grown;
+		tracked_count = count;
+	}
+	return &tracked[handle];
+}
+
+static void
+track_set(uint32_t handle, int state)
+{
+	struct tracked *entry;
+
+	pthread_mutex_lock(&lock);
+	if ((entry = track(handle, state != TRACK_NONE)) != NULL) {
+		entry->job = 0;
+		entry->state = (uint8_t)state;
+	}
+	pthread_mutex_unlock(&lock);
+}
+
+/*
  * A job chain to the GPU. Linux's driver gives back nothing and puts the job's fence into the sync
  * object out_sync; HakiosMali gives back the job's number where the chain's address was (jc). The
  * address is put back, as Linux leaves it, and the number goes into the sync object. The fences to
@@ -377,6 +467,17 @@ submit(struct drm_panfrost_submit *request)
 	request->jc = chain;
 	pthread_mutex_lock(&lock);
 	submitted = seq > submitted ? seq : submitted;
+	if (fast_wait_on()) {
+		const uint32_t *handles = (const uint32_t *)(uintptr_t)request->bo_handles;
+
+		for (uint32_t i = 0; handles != NULL && i < request->bo_handle_count; i++) {
+			struct tracked *entry = track(handles[i], false);
+
+			if (entry != NULL && entry->state == TRACK_BUFFER && seq > entry->job) {
+				entry->job = seq;
+			}
+		}
+	}
 	if (request->out_sync != 0 && (fence = syncobj(request->out_sync)) != NULL) {
 		*fence = seq;
 	}
@@ -393,12 +494,33 @@ static int
 wait_buffer(struct drm_panfrost_wait_bo *request)
 {
 	struct drm_panfrost_wait_bo asked = *request;
+	uint64_t job = 0;
 	int error;
 
+	if (fast_wait_on()) {
+		struct tracked *entry;
+
+		pthread_mutex_lock(&lock);
+		entry = track(request->handle, false);
+		if (entry != NULL && entry->state == TRACK_BUFFER) {
+			job = entry->job;
+			if (job <= finished) {
+				pthread_mutex_unlock(&lock);
+				return 0;
+			}
+		}
+		pthread_mutex_unlock(&lock);
+	}
 	do {
 		asked.timeout_ns = left_ns(request->timeout_ns);
 		error = call(DRM_COMMAND_BASE + DRM_PANFROST_WAIT_BO, &asked, sizeof(asked));
 	} while (error == ETIMEDOUT && left_ns(request->timeout_ns) > 0);
+	if (error == 0 && job != 0) {
+		/* the kernel has said the job that last named the buffer is done, and with it all before it */
+		pthread_mutex_lock(&lock);
+		finished = job > finished ? job : finished;
+		pthread_mutex_unlock(&lock);
+	}
 	return error;
 }
 
