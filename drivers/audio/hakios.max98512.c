@@ -562,13 +562,19 @@ reset(const struct amp *a)
 			return false;
 		}
 	}
-	if (get(a, GLOBAL_SHDN, &shdn) != 0 || get(a, AMP_EN, &en) != 0 || (shdn & 1) != 0 || (en & 1) != 0) {
-		say("max98512: %s (%#x): after the software reset GLOBAL_SHDN %#x, AMP_EN %#x: not shut down; no more writing "
-		    "for this run\n", a->name, a->addr, shdn, en);
-		broken = true;
-		return false;
+	/* A B's REV_ID answers at once, before the reset has taken (the Note9's, seen: AMP_EN still 0x81 on the first
+	   read and 0x80 a moment later): so the shutdown is waited for, until the same deadline, not read once. */
+	for (deadline = deadline_us(RESET_US);;) {
+		if (get(a, GLOBAL_SHDN, &shdn) == 0 && get(a, AMP_EN, &en) == 0 && (shdn & 1) == 0 && (en & 1) == 0) {
+			return true;
+		}
+		if (mach_absolute_time() > deadline) {
+			say("max98512: %s (%#x): after the software reset GLOBAL_SHDN %#x, AMP_EN %#x: not shut down; no more writing "
+			    "for this run\n", a->name, a->addr, shdn, en);
+			broken = true;
+			return false;
+		}
 	}
-	return true;
 }
 
 /*
