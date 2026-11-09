@@ -545,6 +545,52 @@ SYSCTL_PROC(_kern_hakios, OID_AUTO, brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFL
     NULL, 0,
     panel_sysctl_brightness, "I", "the panel's brightness, 0-255 (-1: never set); writing sets it (Galaxy S9, panel=1)");
 
+/*
+ * kern.hakios.display: 0 the panel's output off (DCS 28), 1 on again (DCS 29), between Samsung's keys as for the display
+ * off of blank() above -- and no sleep-in: a panel in command mode keeps what it shows in its own memory, so what 29
+ * brings back needs no power-on sequence. For a screen that iOS has blanked (userland/src/inject_sb.c, panel_blank=1):
+ * the brightness alone leaves the panel lit at its lowest level. -1 read: never set.
+ */
+static int panel_display_state = -1;
+
+static int
+panel_display(int on)
+{
+	static const uint8_t key_on[] = { 0x9F, 0xA5, 0xA5 }, key_off[] = { 0x9F, 0x5A, 0x5A };
+	static const uint8_t display_off[] = { 0x28 }, display_on[] = { 0x29 };
+	bool ok;
+
+	if (dsim == 0 || panel_lock == NULL) {
+		return ENODEV;
+	}
+	lck_mtx_lock(panel_lock);
+	ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(on ? display_on : display_off, 1);
+	ok = dsim_send(key_off, sizeof(key_off)) && ok;
+	if (ok) {
+		panel_display_state = on ? 1 : 0;
+	}
+	lck_mtx_unlock(panel_lock);
+	say("s6e3ha8: display %s (%s) (FIFOCTRL %x, INTSRC %x)\n", on ? "on (29)" : "off (28)", ok ? "sent" : "NOT SENT",
+	    rd(DSIM_FIFOCTRL), rd(DSIM_INTSRC));
+	return ok ? 0 : EIO;
+}
+
+static int
+panel_sysctl_display(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int value = panel_display_state, error;
+
+	error = sysctl_io_number(req, value, sizeof(value), &value, NULL);
+	if (error != 0 || req->newptr == 0) {
+		return error;
+	}
+	return value == 0 || value == 1 ? panel_display(value) : EINVAL;
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, display, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY | CTLFLAG_KERN,
+    NULL, 0,
+    panel_sysctl_display, "I", "the panel's output: 0 off, 1 on (-1: never set); writing sets it (panel=1)");
+
 
 /*
  * The panel dark, for a halt that powers the phone off (drivers/power/hakios.exynos_poweroff.c, halt_off=N): Samsung's

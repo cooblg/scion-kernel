@@ -1579,6 +1579,8 @@ static void (*bks_brightness_set)(float level, long unknown);
 static id brightness_client;            /* a BrightnessSystemClient, when BackBoardServices has not the function */
 static dispatch_queue_t brightness_queue;
 static int brightness_blanked_token = NOTIFY_TOKEN_INVALID;
+static bool panel_blank_on;             /* boot-arg panel_blank=1: the panel's output off while the screen is blanked */
+static int panel_blanked;               /* what kern.hakios.display was last given: 1 off, 0 on */
 /* on brightness_queue only: */
 static int brightness_written = -2, brightness_said = -2, brightness_writes, brightness_calls;
 static float brightness_value = -1, brightness_polled = -2;
@@ -1637,6 +1639,15 @@ brightness_push(void)
 	if (brightness_blanked_token != NOTIFY_TOKEN_INVALID &&
 	    notify_get_state(brightness_blanked_token, &state) == NOTIFY_STATUS_OK && state != 0) {
 		blanked = 1;
+	}
+	if (panel_blank_on && brightness_blanked_token != NOTIFY_TOKEN_INVALID && blanked != panel_blanked) {
+		int on = blanked ? 0 : 1;
+		int display_error = sysctlbyname("kern.hakios.display", NULL, NULL, &on, sizeof(on)) == 0 ? 0 : errno;
+
+		say("hakios: brightness: panel_blank=1: the screen %s: kern.hakios.display=%d %s%s%s\n", blanked ? "is blanked" :
+		    "is back", on, display_error == 0 ? "written" : "refused (", display_error == 0 ? "" : strerror(display_error),
+		    display_error == 0 ? "" : ")");
+		panel_blanked = blanked;        /* (also when refused: not asked again at every tick) */
 	}
 	level = blanked ? 0 : BRIGHTNESS_FLOOR + (int)((255 - BRIGHTNESS_FLOOR) * value * value + 0.5f);
 	if (!blanked && level < BRIGHTNESS_FLOOR) {
@@ -2483,6 +2494,7 @@ brightness_bridge(const char *arguments)
 			    sel_registerName("alloc")), sel_registerName("init"));
 		}
 	}
+	panel_blank_on = strstr(arguments, "panel_blank=1") != NULL;
 	if (mode >= 2 && notify_register_check("com.apple.springboard.hasBlankedScreen", &brightness_blanked_token) !=
 	    NOTIFY_STATUS_OK) {
 		brightness_blanked_token = NOTIFY_TOKEN_INVALID;
