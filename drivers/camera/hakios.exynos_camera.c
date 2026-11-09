@@ -2536,7 +2536,10 @@ static uint32_t manual_lines, manual_again;
 static bool manual, manual_pending;
 static uint64_t manual_until;            /* the reader's exposure holds until then: two seconds after its last */
 static uint32_t stream_readers;
-static uint8_t pack_line[LINE_BYTES], packed[RAW10_LINE];
+static uint8_t packed[RAW10_LINE];
+static uint8_t cached_frame[FRAME_H * LINE_BYTES] __attribute__((aligned(64)));  /* a slot copied out of the uncached ring */
+static uint64_t read_copy_ns, read_pack_ns;
+static uint32_t read_count;
 
 static int
 s9dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
@@ -2605,20 +2608,46 @@ s9dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	lck_mtx_unlock(&s9cam_lock);
 
 	error = uiomove((caddr_t)&f, (int)MIN((user_ssize_t)sizeof(f), uio_resid(uio)), uio);
-	/* the frame, packed a line at a time (one reader at a time: the line buffers are shared) */
+	/*
+	 * The frame, packed a line at a time (one reader at a time: the line buffers are shared). The ring is a
+	 * write-combined mapping (uncached): reading it a few bytes at a time, as the packing did, took 60 ms. The slot
+	 * is now copied once, in whole lines, into ordinary memory, and packed from there.
+	 */
 	lck_mtx_lock(&s9read_lock);
-	for (uint32_t y = 0; error == 0 && y < FRAME_H && uio_resid(uio) > 0; y++) {
-		memcpy(pack_line, (const void *)(buffer + (uint64_t)slot * SLOT_BYTES + (uint64_t)y * LINE_BYTES), LINE_BYTES);
-		for (uint32_t x = 0, o = 0; x < FRAME_W; x += 4, o += 5) {
-			uint32_t v[4];
+	uint64_t t0 = mach_absolute_time();
 
-			for (uint32_t k = 0; k < 4; k++) {
-				v[k] = ((uint32_t)pack_line[2 * (x + k)] | ((uint32_t)pack_line[2 * (x + k) + 1] << 8)) & 0x3ff;
-				packed[o + k] = (uint8_t)(v[k] >> 2);
-			}
-			packed[o + 4] = (uint8_t)((v[0] & 3) | ((v[1] & 3) << 2) | ((v[2] & 3) << 4) | ((v[3] & 3) << 6));
+	memcpy(cached_frame, (const void *)(buffer + (uint64_t)slot * SLOT_BYTES), (size_t)FRAME_H * LINE_BYTES);
+	uint64_t t1 = mach_absolute_time();
+
+	for (uint32_t y = 0; error == 0 && y < FRAME_H && uio_resid(uio) > 0; y++) {
+		const uint64_t *src = (const uint64_t *)(cached_frame + (uint64_t)y * LINE_BYTES);
+
+		for (uint32_t x = 0, o = 0; x < FRAME_W; x += 4, o += 5) {
+			uint64_t w = src[x / 4];                /* four pixels of 16 bits */
+			uint32_t v0 = (uint32_t)w & 0x3ff, v1 = (uint32_t)(w >> 16) & 0x3ff, v2 = (uint32_t)(w >> 32) & 0x3ff,
+			    v3 = (uint32_t)(w >> 48) & 0x3ff;
+
+			packed[o] = (uint8_t)(v0 >> 2);
+			packed[o + 1] = (uint8_t)(v1 >> 2);
+			packed[o + 2] = (uint8_t)(v2 >> 2);
+			packed[o + 3] = (uint8_t)(v3 >> 2);
+			packed[o + 4] = (uint8_t)((v0 & 3) | ((v1 & 3) << 2) | ((v2 & 3) << 4) | ((v3 & 3) << 6));
 		}
 		error = uiomove((caddr_t)packed, (int)MIN((user_ssize_t)RAW10_LINE, uio_resid(uio)), uio);
+	}
+	uint64_t t2 = mach_absolute_time();
+
+	read_copy_ns += t1 - t0;
+	read_pack_ns += t2 - t1;
+	if (++read_count == 120) {
+		uint64_t c, k;
+
+		absolutetime_to_nanoseconds(read_copy_ns / read_count, &c);
+		absolutetime_to_nanoseconds(read_pack_ns / read_count, &k);
+		say("exynos_camera: 7: a read takes %llu us to copy the slot out of the uncached ring, %llu us to pack and hand it over\n",
+		    c / 1000, k / 1000);
+		read_count = 0;
+		read_copy_ns = read_pack_ns = 0;
 	}
 	lck_mtx_unlock(&s9read_lock);
 	lck_mtx_lock(&s9cam_lock);

@@ -443,6 +443,8 @@ lsc_at(const struct isp *isp, float u, float v, float g[3])
 	}
 }
 
+#define CELL_ROW_MAX 1024
+
 /* one line of the picture as 8-bit R, G, B */
 static void
 render_line(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint32_t width, uint32_t height,
@@ -458,7 +460,7 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 	if (isp->turned) {
 		row = height - 1 - row;         /* (and each line from its end, below) */
 	}
-	if (cw < width && ch < height) {
+	if (cw < width && ch < height && cells_w > CELL_ROW_MAX) {
 		/*
 		 * Magnified (the zoom): each pixel between the four cells around it. The nearest cell blown up
 		 * to a square of pixels showed every cell's own colour, its noise and the colours a 2x2 cell
@@ -496,6 +498,65 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 				lsc_at(isp, cells_w > 1 ? (float)cx0 / (cells_w - 1) : 0, v_at, gains);
 			}
 			pixel(isp, &p, c[0] * gains[0], c[1] * gains[1], c[2] * gains[2], rgb + 3 * (isp->turned ? width - 1 - x : x));
+		}
+		return;
+	}
+	if (cells_w <= CELL_ROW_MAX) {
+		/*
+		 * Not magnified: each cell's colour is made once (a cell row is kept for the rows that use it: the picture
+		 * is about twice the cells), and the picture is those colours smoothly stretched. The pixel at a time,
+		 * nearest cell, this was (the same colours repeated twice a side, 1.7 million sums for half a million
+		 * cells) was a picture of 816 x 612 enlarged.
+		 */
+		static __thread struct { uint64_t key; uint8_t rgb[CELL_ROW_MAX * 3]; } cache[2];
+		float fy = y0 + (row + 0.5f) * ch / height - 0.5f;
+		uint32_t cy0 = fy < 0 ? 0 : (uint32_t)fy, cy1;
+		uint32_t ty;
+		const uint8_t *a_row, *b_row;
+
+		cy0 = cy0 > cells_h - 1 ? cells_h - 1 : cy0;
+		cy1 = cy0 + 1 > cells_h - 1 ? cells_h - 1 : cy0 + 1;
+		ty = fy < (float)cy0 ? 0 : (uint32_t)((fy - cy0) * 256);
+		for (int k = 0; k < 2; k++) {
+			uint32_t cy = k ? cy1 : cy0;
+			uint64_t key = (f->sequence << 16) | (cy + 1);
+			int slot = (int)(cy & 1);
+
+			if (cache[slot].key != key) {
+				const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
+				float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0, gains[3] = { 1, 1, 1 };
+
+				for (uint32_t cx = x0 > 0 ? x0 - 1 : 0; cx < cells_w && cx <= x0 + cw + 1; cx++) {
+					int v[4], g = 0;
+
+					cell(top, f->stride, cx, v);
+					for (int j = 0; j < 4; j++) {
+						g += j != r && j != b ? v[j] : 0;
+					}
+					if (isp->lsc.on) {
+						lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
+					}
+					pixel(isp, &p, v[r] * gains[0], g * 0.5f * gains[1], v[b] * gains[2], cache[slot].rgb + 3 * cx);
+				}
+				cache[slot].key = key;
+			}
+		}
+		a_row = cache[cy0 & 1].rgb;
+		b_row = cache[cy1 & 1].rgb;
+		uint64_t step = ((uint64_t)cw << 16) / width, at = ((uint64_t)x0 << 16) + step / 2;
+
+		for (uint32_t x = 0; x < width; x++, at += step) {
+			uint32_t fx = at > 32768 ? (uint32_t)(at - 32768) : 0, cx0 = fx >> 16, tx = (fx >> 8) & 255, cx1;
+			uint8_t *o = rgb + 3 * (isp->turned ? width - 1 - x : x);
+
+			cx0 = cx0 > cells_w - 1 ? cells_w - 1 : cx0;
+			cx1 = cx0 + 1 > cells_w - 1 ? cells_w - 1 : cx0 + 1;
+			for (int c = 0; c < 3; c++) {
+				uint32_t top_v = a_row[3 * cx0 + c] * (256 - tx) + a_row[3 * cx1 + c] * tx;
+				uint32_t bot_v = b_row[3 * cx0 + c] * (256 - tx) + b_row[3 * cx1 + c] * tx;
+
+				o[c] = (uint8_t)((top_v * (256 - ty) + bot_v * ty) >> 16);
+			}
 		}
 		return;
 	}
