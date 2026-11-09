@@ -209,7 +209,7 @@ void hakios_max98512_quiesce(void) {}
 #ifndef HAKIOS_S6E3HA8
 void hakios_s6e3ha8_init(void) {}
 bool hakios_s6e3ha8_blank(__unused int (*say)(const char *, ...)) { return false; }      /* "not blanked" */
-bool hakios_panel_display_off(void) { return false; }
+bool hakios_panel_touch_blocked(__unused uint32_t type, __unused uint32_t finger) { return false; }
 #endif
 
 #ifndef HAKIOS_EXYNOS_POWEROFF

@@ -136,46 +136,9 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	wakeup(&touch_queue);
 }
 
-/*
- * Boot-arg touch_blank=1: while the panel's output is off (kern.hakios.display=0, userland/src/inject_sb.c's
- * panel_blank=1), the touch screen's new touches are not passed on -- a screen that iOS has blanked is not woken by a
- * touch (a pocket, a finger on the way past); the side button still does it. A finger already down when the screen
- * went dark is passed on to its lifting, so that iOS is not left with a finger that never leaves.
- */
-extern bool hakios_panel_display_off(void);
-
-static bool
-touch_blanked(uint32_t type, uint32_t finger)
-{
-	static int gate = -1;
-	static uint32_t down;                   /* fingers passed on and not yet lifted (bit = finger) */
-	uint32_t on = 0, bit = finger < 32 ? 1u << finger : 0;
-
-	if (gate < 0) {
-		gate = PE_parse_boot_argn("touch_blank", &on, sizeof(on)) && on != 0;
-	}
-	if (type < HAKIOS_TOUCH_DOWN || type > HAKIOS_TOUCH_UP) {
-		return false;                   /* (the buttons are not touches) */
-	}
-	if (type == HAKIOS_TOUCH_DOWN && !(gate && hakios_panel_display_off())) {
-		down |= bit;
-	} else if (type == HAKIOS_TOUCH_UP) {
-		bool known = (down & bit) != 0;
-
-		down &= ~bit;
-		return gate && hakios_panel_display_off() && !known;
-	} else if (type == HAKIOS_TOUCH_DOWN || !(down & bit)) {
-		return gate && hakios_panel_display_off();
-	}
-	return false;
-}
-
 void
 hakios_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
 {
-	if (touch_blanked(type, finger)) {
-		return;
-	}
 	touch_post(type, finger, x, y, true);
 }
 

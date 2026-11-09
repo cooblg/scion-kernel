@@ -584,12 +584,41 @@ panel_display(int on)
 	return ok ? 0 : EIO;
 }
 
-/* true while the panel's output is off by kern.hakios.display (drivers/input/hakios.input.c: touch_blank=1) */
-bool hakios_panel_display_off(void);
+/*
+ * Boot-arg touch_blank=1: while the panel's output is off (kern.hakios.display=0, userland/src/inject_sb.c's
+ * panel_blank=1), the touch screen's new touches are not passed on (hakios.s6sy761.c asks before each) -- a screen that
+ * iOS has blanked is not woken by a touch (a pocket, a finger on the way past); the side button still does it. A finger
+ * already down when the screen went dark is passed on to its lifting, so that iOS is not left with a finger that
+ * never leaves. (Not in hakios.input.c: patch 1203 is made against that file.)
+ * type: 1 down, 2 move, 3 up (sys/hakios.input.h). True: not to be passed on.
+ */
+bool hakios_panel_touch_blocked(uint32_t type, uint32_t finger);
+
 bool
-hakios_panel_display_off(void)
+hakios_panel_touch_blocked(uint32_t type, uint32_t finger)
 {
-	return panel_display_state == 0;
+	static int gate = -1;
+	static uint32_t down;                   /* fingers passed on and not yet lifted (bit = finger) */
+	uint32_t on = 0, bit = finger < 32 ? 1u << finger : 0;
+	bool dark;
+
+	if (gate < 0) {
+		gate = PE_parse_boot_argn("touch_blank", &on, sizeof(on)) && on != 0;
+	}
+	dark = gate && panel_display_state == 0;
+	if (type == 1) {                        /* a finger lands: passed on unless the screen is dark */
+		if (!dark) {
+			down |= bit;
+		}
+		return dark;
+	}
+	if (type == 3) {                        /* a finger lifts: passed on if its landing was */
+		bool known = (down & bit) != 0;
+
+		down &= ~bit;
+		return dark && !known;
+	}
+	return !(down & bit) && dark;           /* a move: passed on for a finger that was */
 }
 
 static int

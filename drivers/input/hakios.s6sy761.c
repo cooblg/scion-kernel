@@ -168,13 +168,24 @@ extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation
 /* s6sy761_trace=N: the first N finger events said, with the time (ms, the 24 MHz counter), to measure the rate */
 static uint32_t trace_left;
 
+/* hakios_touch_post() unless the panel is dark and touch_blank=1 says a touch is not to wake it (hakios.s6e3ha8.c) */
+extern bool hakios_panel_touch_blocked(uint32_t type, uint32_t finger);
+
+static void
+touch_post_gated(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
+{
+	if (!hakios_panel_touch_blocked(type, finger)) {
+		hakios_touch_post(type, finger, x, y);
+	}
+}
+
 static void
 all_up(void)
 {
 	for (uint32_t f = 0; f < FINGERS; f++) {
 		if (finger_down[f]) {
 			finger_down[f] = false;
-			hakios_touch_post(HAKIOS_TOUCH_UP, f, 0, 0);
+			touch_post_gated(HAKIOS_TOUCH_UP, f, 0, 0);
 		}
 	}
 }
@@ -206,14 +217,14 @@ handle_event(const uint8_t *e)
 		if (state == 3) {
 			if (finger_down[id]) {
 				finger_down[id] = false;
-				hakios_touch_post(HAKIOS_TOUCH_UP, id, nx, ny);
+				touch_post_gated(HAKIOS_TOUCH_UP, id, nx, ny);
 			}
 		} else if (!finger_down[id]) {
 			finger_down[id] = true;
 			stats.downs++;
-			hakios_touch_post(HAKIOS_TOUCH_DOWN, id, nx, ny);
+			touch_post_gated(HAKIOS_TOUCH_DOWN, id, nx, ny);
 		} else {
-			hakios_touch_post(HAKIOS_TOUCH_MOVE, id, nx, ny);
+			touch_post_gated(HAKIOS_TOUCH_MOVE, id, nx, ny);
 		}
 	} else if (kind == 1) {
 		uint32_t type = (e[0] >> 2) & 0xf, sid = e[1];
