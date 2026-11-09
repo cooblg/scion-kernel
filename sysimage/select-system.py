@@ -144,7 +144,11 @@ BIG_KEEP = ('usr/libexec/locationd',)
 # audio goes through, with its tunings (signal processing chains) for this model and for any, and the
 # system's own sounds. Not the neural networks among the tunings, nor the sounds of the watch.
 AUDIO = ('Library/Audio/Plug-Ins/', 'Library/Audio/Tunings/D22/', 'Library/Audio/Tunings/Generic/',
-         'System/Library/Audio/UISounds/')
+         'System/Library/Audio/UISounds/',
+         # the Bluetooth audio device (A2DP): bluetoothd publishes each paired speaker to it over the mach service
+         # com.apple.BTAudioHALPlugin.xpc, and without it there is nobody to take the audio device ("no available xpc
+         # client connections"): the Note9's sound stayed on the speaker
+         'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/')
 SKIP_AUDIO = ('System/Library/Audio/UISounds/nano/',)
 KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB')
 
