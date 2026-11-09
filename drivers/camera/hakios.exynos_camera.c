@@ -2539,6 +2539,8 @@ static uint32_t stream_readers;
 static uint8_t packed[RAW10_LINE];
 static uint8_t cached_frame[FRAME_H * LINE_BYTES] __attribute__((aligned(64)));  /* a slot copied out of the uncached ring */
 static uint64_t read_copy_ns, read_pack_ns;
+static vm_offset_t buffer_rd;           /* the ring again, write-back cached, for read() */
+static bool buffer_rd_tried;
 static uint32_t read_count;
 
 static int
@@ -2616,7 +2618,21 @@ s9dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 	lck_mtx_lock(&s9read_lock);
 	uint64_t t0 = mach_absolute_time();
 
-	memcpy(cached_frame, (const void *)(buffer + (uint64_t)slot * SLOT_BYTES), (size_t)FRAME_H * LINE_BYTES);
+	if (buffer_rd == 0 && !buffer_rd_tried) {
+		buffer_rd_tried = true;
+		buffer_rd = hakios_physmap_cached(buffer_pa, MEM_BYTES);
+		say("exynos_camera: 7: the ring read through a cached mapping: %s\n", buffer_rd != 0 ? "yes" : "no (the uncached one stays)");
+	}
+	if (buffer_rd != 0) {
+		/* the DMA wrote this slot behind the cache: its lines are thrown away before they are read */
+		for (vm_offset_t a = buffer_rd + (uint64_t)slot * SLOT_BYTES, e = a + (uint64_t)FRAME_H * LINE_BYTES; a < e; a += 64) {
+			__asm__ volatile ("dc civac, %0" : : "r" (a) : "memory");
+		}
+		__asm__ volatile ("dsb sy" : : : "memory");
+		memcpy(cached_frame, (const void *)(buffer_rd + (uint64_t)slot * SLOT_BYTES), (size_t)FRAME_H * LINE_BYTES);
+	} else {
+		memcpy(cached_frame, (const void *)(buffer + (uint64_t)slot * SLOT_BYTES), (size_t)FRAME_H * LINE_BYTES);
+	}
 	uint64_t t1 = mach_absolute_time();
 
 	for (uint32_t y = 0; error == 0 && y < FRAME_H && uio_resid(uio) > 0; y++) {
