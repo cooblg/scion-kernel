@@ -502,19 +502,46 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 		}
 		return;
 	}
-	if (cells_w <= CELL_ROW_MAX) {
+	if (cells_w <= CELL_ROW_MAX && width <= 8192) {
 		/*
 		 * Not magnified: each cell's colour is made once (a cell row is kept for the rows that use it: the picture
-		 * is about twice the cells), and the picture is those colours smoothly stretched. The pixel at a time,
-		 * nearest cell, this was (the same colours repeated twice a side, 1.7 million sums for half a million
-		 * cells) was a picture of 816 x 612 enlarged.
+		 * is about twice the cells), the two cell rows around the picture's row are blended into one (the same
+		 * short loop for every cell, which the processor does several at a time), and that row is stretched to the
+		 * picture's width with the places and weights of the columns, which are the same for every row of a picture and so
+		 * made once (they were worked out for each pixel of each row).
 		 */
-		static __thread struct { uint64_t key; uint8_t rgb[CELL_ROW_MAX * 3]; } cache[2];
+		static __thread struct {
+			uint64_t key;
+			uint32_t lo, hi;
+			uint8_t rgb[CELL_ROW_MAX * 3];
+		} cache[2];
+		static __thread struct {
+			uint32_t width, x0, cw, cells_w;
+			uint16_t i0[8192], i1[8192];
+			uint8_t tx[8192];
+		} cols;
+		uint8_t blended[CELL_ROW_MAX * 3];
 		float fy = y0 + (row + 0.5f) * ch / height - 0.5f;
 		uint32_t cy0 = fy < 0 ? 0 : (uint32_t)fy, cy1;
-		uint32_t ty;
+		uint32_t ty, lo = x0 > 0 ? x0 - 1 : 0, hi = x0 + cw + 2 < cells_w ? x0 + cw + 2 : cells_w;
 		const uint8_t *a_row, *b_row;
 
+		if (cols.width != width || cols.x0 != x0 || cols.cw != cw || cols.cells_w != cells_w) {
+			uint64_t step = ((uint64_t)cw << 16) / width, at = ((uint64_t)x0 << 16) + step / 2;
+
+			for (uint32_t x = 0; x < width; x++, at += step) {
+				uint32_t fx = at > 32768 ? (uint32_t)(at - 32768) : 0, c0 = fx >> 16;
+
+				c0 = c0 > cells_w - 1 ? cells_w - 1 : c0;
+				cols.i0[x] = (uint16_t)c0;
+				cols.i1[x] = (uint16_t)(c0 + 1 > cells_w - 1 ? cells_w - 1 : c0 + 1);
+				cols.tx[x] = (uint8_t)((fx >> 8) & 255);
+			}
+			cols.width = width;
+			cols.x0 = x0;
+			cols.cw = cw;
+			cols.cells_w = cells_w;
+		}
 		cy0 = cy0 > cells_h - 1 ? cells_h - 1 : cy0;
 		cy1 = cy0 + 1 > cells_h - 1 ? cells_h - 1 : cy0 + 1;
 		ty = fy < (float)cy0 ? 0 : (uint32_t)((fy - cy0) * 256);
@@ -523,11 +550,11 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 			uint64_t key = (f->sequence << 16) | (cy + 1);
 			int slot = (int)(cy & 1);
 
-			if (cache[slot].key != key) {
+			if (cache[slot].key != key || cache[slot].lo != lo || cache[slot].hi != hi) {
 				const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
 				float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0, gains[3] = { 1, 1, 1 };
 
-				for (uint32_t cx = x0 > 0 ? x0 - 1 : 0; cx < cells_w && cx <= x0 + cw + 1; cx++) {
+				for (uint32_t cx = lo; cx < hi; cx++) {
 					int v[4], g = 0;
 
 					cell(top, f->stride, cx, v);
@@ -540,24 +567,23 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 					pixel(isp, &p, v[r] * gains[0], g * 0.5f * gains[1], v[b] * gains[2], cache[slot].rgb + 3 * cx);
 				}
 				cache[slot].key = key;
+				cache[slot].lo = lo;
+				cache[slot].hi = hi;
 			}
 		}
 		a_row = cache[cy0 & 1].rgb;
 		b_row = cache[cy1 & 1].rgb;
-		uint64_t step = ((uint64_t)cw << 16) / width, at = ((uint64_t)x0 << 16) + step / 2;
-
-		for (uint32_t x = 0; x < width; x++, at += step) {
-			uint32_t fx = at > 32768 ? (uint32_t)(at - 32768) : 0, cx0 = fx >> 16, tx = (fx >> 8) & 255, cx1;
+		for (uint32_t i = 3 * lo; i < 3 * hi; i++) {
+			blended[i] = (uint8_t)((a_row[i] * (256 - ty) + b_row[i] * ty) >> 8);
+		}
+		for (uint32_t x = 0; x < width; x++) {
+			const uint8_t *p0 = blended + 3 * cols.i0[x], *p1 = blended + 3 * cols.i1[x];
+			uint32_t tx = cols.tx[x];
 			uint8_t *o = rgb + 3 * (isp->turned ? width - 1 - x : x);
 
-			cx0 = cx0 > cells_w - 1 ? cells_w - 1 : cx0;
-			cx1 = cx0 + 1 > cells_w - 1 ? cells_w - 1 : cx0 + 1;
-			for (int c = 0; c < 3; c++) {
-				uint32_t top_v = a_row[3 * cx0 + c] * (256 - tx) + a_row[3 * cx1 + c] * tx;
-				uint32_t bot_v = b_row[3 * cx0 + c] * (256 - tx) + b_row[3 * cx1 + c] * tx;
-
-				o[c] = (uint8_t)((top_v * (256 - ty) + bot_v * ty) >> 16);
-			}
+			o[0] = (uint8_t)((p0[0] * (256 - tx) + p1[0] * tx) >> 8);
+			o[1] = (uint8_t)((p0[1] * (256 - tx) + p1[1] * tx) >> 8);
+			o[2] = (uint8_t)((p0[2] * (256 - tx) + p1[2] * tx) >> 8);
 		}
 		return;
 	}
