@@ -648,6 +648,184 @@ nv12_pair(const uint8_t *rgb0, const uint8_t *rgb1, uint32_t width, uint8_t *y0,
 	}
 }
 
+/*
+ * The moving picture as NV12 made at the cells' size and then stretched, instead of made at the picture's: each cell's colour is
+ * turned into Y, Cb and Cr once (a cell is about a quarter of the picture's pixels), the rows of cells around a row are blended, and the
+ * result is stretched to the width of the picture with the column places and weights made once. Turning RGB into Y, Cb, Cr is a
+ * straight (affine) sum, and so is blending, so doing the sum first and the blending after gives the pictures' values within a step or
+ * two of doing them the other way round (tools: the host test beside src/ compares both). The chroma comes from the point at the middle of each
+ * 2 x 2 block of the picture, not from the mean of its four pixels' colours.
+ */
+#define NV12_SLOTS 4
+struct ycc_row {
+	uint64_t key;
+	uint32_t lo, hi;
+	uint8_t y[CELL_ROW_MAX], cb[CELL_ROW_MAX], cr[CELL_ROW_MAX];
+};
+
+static void
+ycc_cells(const struct isp *isp, const struct pipe *p, const struct hakios_camera_frame *f, const uint8_t *raw, uint32_t cy,
+    uint32_t lo, uint32_t hi, int r, int b, const int32_t *k, bool video, struct ycc_row *out)
+{
+	const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
+	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
+	float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0, gains[3] = { 1, 1, 1 };
+	int32_t oy = (video ? 16 << 16 : 0) + (1 << 15), oc = (128 << 16) + (1 << 15) - 1;
+
+	for (uint32_t cx = lo; cx < hi; cx++) {
+		int v[4], g = 0;
+		uint8_t rgb[3];
+		int32_t cb, cr;
+
+		cell(top, f->stride, cx, v);
+		for (int j = 0; j < 4; j++) {
+			g += j != r && j != b ? v[j] : 0;
+		}
+		if (isp->lsc.on) {
+			lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
+		}
+		pixel(isp, p, v[r] * gains[0], g * 0.5f * gains[1], v[b] * gains[2], rgb);
+		out->y[cx] = (uint8_t)((k[0] * rgb[0] + k[1] * rgb[1] + k[2] * rgb[2] + oy) >> 16);
+		cb = (k[3] * rgb[0] + k[4] * rgb[1] + k[5] * rgb[2] + oc) >> 16;
+		cr = (k[6] * rgb[0] + k[7] * rgb[1] + k[8] * rgb[2] + oc) >> 16;
+		out->cb[cx] = (uint8_t)(cb < 0 ? 0 : cb > 255 ? 255 : cb);
+		out->cr[cx] = (uint8_t)(cr < 0 ? 0 : cr > 255 ? 255 : cr);
+	}
+}
+
+/* the cached row of cells for cy: made if it is not there for this frame, this crop and this colour setting */
+static const struct ycc_row *
+ycc_get(struct ycc_row *cache, const struct isp *isp, const struct pipe *p, const struct hakios_camera_frame *f, const uint8_t *raw,
+    uint32_t cy, uint32_t lo, uint32_t hi, int r, int b, const int32_t *k, bool video)
+{
+	struct ycc_row *slot = &cache[cy % NV12_SLOTS];
+	uint64_t key = (f->sequence << 17) | ((uint64_t)(cy + 1) << 1) | (video ? 1 : 0);
+
+	if (slot->key != key || slot->lo != lo || slot->hi != hi) {
+		ycc_cells(isp, p, f, raw, cy, lo, hi, r, b, k, video, slot);
+		slot->key = key;
+		slot->lo = lo;
+		slot->hi = hi;
+	}
+	return slot;
+}
+
+/* blend two rows of one plane by ty/256 over [lo, hi) */
+static void
+blend_plane(uint8_t *out, const uint8_t *a, const uint8_t *b, uint32_t ty, uint32_t lo, uint32_t hi)
+{
+	for (uint32_t i = lo; i < hi; i++) {
+		out[i] = (uint8_t)((a[i] * (256 - ty) + b[i] * ty) >> 8);
+	}
+}
+
+static void
+render_nv12_cells(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
+    uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video)
+{
+	static const int32_t full[9] = { 19595, 38470, 7471, -11058, -21710, 32768, 32768, -27439, -5329 };
+	static const int32_t vid[9] = { 16829, 33039, 6416, -9714, -19070, 28784, 28784, -24103, -4681 };
+	static __thread struct ycc_row cache[NV12_SLOTS];
+	static __thread struct {
+		uint32_t width, x0, cw, cells_w;
+		uint16_t yi0[8192], yi1[8192], ci0[4096], ci1[4096];
+		uint8_t ytx[8192], ctx[4096];
+	} cols;
+	const int32_t *k = video ? vid : full;
+	uint32_t x0, y0, cw, ch, cells_w = f->width / 2, cells_h = f->height / 2;
+	uint32_t lo, hi;
+	uint8_t yb[CELL_ROW_MAX], cbb[CELL_ROW_MAX], crb[CELL_ROW_MAX];
+	int r, b;
+	struct pipe p;
+
+	crop(isp, f, width, height, &x0, &y0, &cw, &ch);
+	cell_places(f->bayer, &r, &b);
+	pipe_init(isp, &p);
+	lo = x0 > 0 ? x0 - 1 : 0;
+	hi = x0 + cw + 2 < cells_w ? x0 + cw + 2 : cells_w;
+	if (cols.width != width || cols.x0 != x0 || cols.cw != cw || cols.cells_w != cells_w) {
+		uint64_t step = ((uint64_t)cw << 16) / width;
+
+		for (uint32_t x = 0; x < width; x++) {
+			uint64_t at = ((uint64_t)x0 << 16) + step / 2 + step * x;
+			uint32_t fx = at > 32768 ? (uint32_t)(at - 32768) : 0, c0 = fx >> 16;
+
+			c0 = c0 > cells_w - 1 ? cells_w - 1 : c0;
+			cols.yi0[x] = (uint16_t)c0;
+			cols.yi1[x] = (uint16_t)(c0 + 1 > cells_w - 1 ? cells_w - 1 : c0 + 1);
+			cols.ytx[x] = (uint8_t)((fx >> 8) & 255);
+		}
+		for (uint32_t xc = 0; xc < width / 2; xc++) {
+			/* the middle of the 2 x 2 block: between its two columns */
+			uint64_t at = ((uint64_t)x0 << 16) + step * (2 * (uint64_t)xc + 1);
+			uint32_t fx = at > 32768 ? (uint32_t)(at - 32768) : 0, c0 = fx >> 16;
+
+			c0 = c0 > cells_w - 1 ? cells_w - 1 : c0;
+			cols.ci0[xc] = (uint16_t)c0;
+			cols.ci1[xc] = (uint16_t)(c0 + 1 > cells_w - 1 ? cells_w - 1 : c0 + 1);
+			cols.ctx[xc] = (uint8_t)((fx >> 8) & 255);
+		}
+		cols.width = width;
+		cols.x0 = x0;
+		cols.cw = cw;
+		cols.cells_w = cells_w;
+	}
+	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
+		/* the chroma row of this pair of rows: the source block, which is the mirrored one if the picture is turned */
+		uint32_t block = isp->turned ? height / 2 - 1 - row / 2 : row / 2;
+		float fyc = y0 + (2.0f * block + 1) * ch / height - 0.5f;
+		uint32_t cyc0 = fyc < 0 ? 0 : (uint32_t)fyc, cyc1, tyc;
+		const struct ycc_row *ca, *cb2;
+
+		cyc0 = cyc0 > cells_h - 1 ? cells_h - 1 : cyc0;
+		cyc1 = cyc0 + 1 > cells_h - 1 ? cells_h - 1 : cyc0 + 1;
+		tyc = fyc < (float)cyc0 ? 0 : (uint32_t)((fyc - cyc0) * 256);
+		for (uint32_t k2 = 0; k2 < 2; k2++) {
+			uint32_t orow = row + k2, srow = isp->turned ? height - 1 - orow : orow;
+			float fy = y0 + (srow + 0.5f) * ch / height - 0.5f;
+			uint32_t cy0 = fy < 0 ? 0 : (uint32_t)fy, cy1, ty;
+			const struct ycc_row *a, *c;
+			uint8_t *o = y + (size_t)orow * y_stride;
+
+			cy0 = cy0 > cells_h - 1 ? cells_h - 1 : cy0;
+			cy1 = cy0 + 1 > cells_h - 1 ? cells_h - 1 : cy0 + 1;
+			ty = fy < (float)cy0 ? 0 : (uint32_t)((fy - cy0) * 256);
+			a = ycc_get(cache, isp, &p, f, raw, cy0, lo, hi, r, b, k, video);
+			c = ycc_get(cache, isp, &p, f, raw, cy1, lo, hi, r, b, k, video);
+			/* (a is kept: its slot differs from c's unless they are the same row) */
+			blend_plane(yb, a->y, c->y, ty, lo, hi);
+			if (isp->turned) {
+				for (uint32_t x = 0; x < width; x++) {
+					uint32_t tx = cols.ytx[x];
+
+					o[width - 1 - x] = (uint8_t)((yb[cols.yi0[x]] * (256 - tx) + yb[cols.yi1[x]] * tx) >> 8);
+				}
+			} else {
+				for (uint32_t x = 0; x < width; x++) {
+					uint32_t tx = cols.ytx[x];
+
+					o[x] = (uint8_t)((yb[cols.yi0[x]] * (256 - tx) + yb[cols.yi1[x]] * tx) >> 8);
+				}
+			}
+		}
+		ca = ycc_get(cache, isp, &p, f, raw, cyc0, lo, hi, r, b, k, video);
+		cb2 = ycc_get(cache, isp, &p, f, raw, cyc1, lo, hi, r, b, k, video);
+		blend_plane(cbb, ca->cb, cb2->cb, tyc, lo, hi);
+		blend_plane(crb, ca->cr, cb2->cr, tyc, lo, hi);
+		{
+			uint8_t *o = uv + (size_t)(row / 2) * uv_stride;
+
+			for (uint32_t xc = 0; xc < width / 2; xc++) {
+				/* xc is the source block; where it is shown: the mirrored one if the picture is turned */
+				uint32_t tx = cols.ctx[xc], to = isp->turned ? width / 2 - 1 - xc : xc;
+
+				o[2 * to] = (uint8_t)((cbb[cols.ci0[xc]] * (256 - tx) + cbb[cols.ci1[xc]] * tx) >> 8);
+				o[2 * to + 1] = (uint8_t)((crb[cols.ci0[xc]] * (256 - tx) + crb[cols.ci1[xc]] * tx) >> 8);
+			}
+		}
+	}
+}
+
 void
 isp_render_nv12(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
     uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
@@ -655,6 +833,10 @@ isp_render_nv12(const struct isp *isp, const struct hakios_camera_frame *f, cons
 	uint8_t line[2][3 * 8192];
 
 	if (width > 8192) {
+		return;
+	}
+	if (width % 2 == 0 && height % 2 == 0 && f->width / 2 <= CELL_ROW_MAX) {
+		render_nv12_cells(isp, f, raw, y, y_stride, uv, uv_stride, width, height, first_row, end_row, video_range);
 		return;
 	}
 	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {

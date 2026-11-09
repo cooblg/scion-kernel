@@ -225,7 +225,13 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'soft
         # these start, crash and are asked for again, over and over. (aggregated, which was among them, is where
         # Darwin userland 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
         # waits for; it now runs through a session.)
-        'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced')
+        'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced',
+        # measured on the Note9 (cputop, 10 November 2026): vmd, the voicemail daemon, looks up CommCenter (denied above:
+        # there is no cellular yet) in a loop and keeps a core at 100 % for as long as it lives (476 failed lookups in two
+        # minutes, launchd with it at 25-33 %); amsengagementd asks for fairplayd, which this kernel cannot give, 76 times and
+        # took 30-76 %. TEMPORARY for vmd: when cellular is brought up and CommCenter is taken out of the list above, take
+        # 'voicemail' out with it (or try it first with ALLOW="voicemail CommCenter").
+        'voicemail', 'amsengagementd')
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
