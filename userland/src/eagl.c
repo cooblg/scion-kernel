@@ -1366,8 +1366,8 @@ show_texture(struct eagl *e, struct image *image)
  */
 #define PROF_SLOTS      8192
 #define PROF_DUMP       4000
-#define PROF_SHOWN      30
-#define PROF_DEPTH      9                       /* the program counter, the link register, seven callers from the frame chain */
+#define PROF_SHOWN      200
+#define PROF_DEPTH      4                       /* the program counter, the link register, seven callers from the frame chain */
 static unsigned prof_us;                        /* 0: no profile */
 static thread_t prof_thread;                    /* the drawing thread, the first that begins a frame */
 static struct {
