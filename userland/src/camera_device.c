@@ -431,7 +431,7 @@ static const struct camera {
 	double          focal_length, f_number, pixel_size, fov;
 	int             formats[2][3];  /* sensor width, height, frames a second of "Photo" and of a video format */
 } cameras[2] = {
-	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false, 4.0, 1.8, 1.22, 65.0,
+	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", true, 4.0, 1.8, 1.22, 65.0,
 	  { { 4032, 3024, 30 }, { 4224, 2376, 60 } } },        /* "Photo", "Video-60" */
 	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", false, 2.87, 2.2, 1.0, 70.0,
 	  { { 3088, 2320, 30 }, { 3840, 2160, 30 } } },        /* "Photo", "Video-30" */
@@ -1804,25 +1804,19 @@ hakios_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, C
 	if ((stream[0] = stream_create(allocator, &cameras[0], port_back)) == NULL) {
 		return ERR_UNSUPPORTED;
 	}
-	if ((stream[1] = stream_create(allocator, &cameras[1], port_front)) == NULL) {
-		CFRelease(stream[0]);
-		return ERR_UNSUPPORTED;
-	}
 	if (derived_create(allocator, &device_vtable, device_class_id(), &device) != 0 || device == NULL) {
 		CFRelease(stream[0]);
-		CFRelease(stream[1]);
 		say("the device cannot be made");
 		return ERR_UNSUPPORTED;
 	}
 	d = derived_storage(device);
 	memset(d, 0, sizeof(*d));
-	d->streams = CFArrayCreate(NULL, (const void **)stream, 2, &kCFTypeArrayCallBacks);
+	d->streams = CFArrayCreate(NULL, (const void **)stream, 1, &kCFTypeArrayCallBacks);
 	all_streams[0] = stream[0];             /* (kept by the device's array) */
-	all_streams[1] = stream[1];
+	all_streams[1] = NULL;                  /* one sensor on this phone: no switching (it crashed mediaserverd) */
 	d->supported = supported(device_props, sizeof(device_props) / sizeof(device_props[0]));
 	CFRelease(stream[0]);
-	CFRelease(stream[1]);
 	*out = device;
-	say("the device made: two streams, the back camera and the front one");
+	say("the device made: one stream (the phone's front sensor, shown as the back camera)");
 	return 0;
 }
