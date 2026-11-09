@@ -140,6 +140,10 @@ BIG_PROGRAM = 10 << 20           # daemons bigger than this (lskdd, ...) are not
 # -- Weather and its widget, Maps, the clock's cities' local weather -- and every app that asks for one
 # waits on a lookup that fails (userland/mkjobs.py runs it on demand; Scion gives it the phone's position)
 BIG_KEEP = ('usr/libexec/locationd',)
+# the executable of a daemon that lives inside a framework's bundle is not small (identityservicesd, 12 MB, past
+# SMALL): without it launchd's job for it points at nothing, and everything that looks up the identity services
+# (iMessage, FaceTime, the Apple ID's device registration) gets "No such process"
+KEEP_FRAMEWORK_EXEC = ('System/Library/PrivateFrameworks/IDS.framework/identityservicesd.app/identityservicesd',)
 # sound, outside the directories above: the virtual audio device, a plug-in that all of mediaserverd's
 # audio goes through, with its tunings (signal processing chains) for this model and for any, and the
 # system's own sounds. Not the neural networks among the tunings, nor the sounds of the watch.
@@ -206,6 +210,8 @@ def wanted_file(path, size):
     if path.startswith(('Applications/', HEALTH)):
         return not path.lower().endswith(SKIP_APP_EXT) and '.mlmodelc/' not in path
     if path.startswith(FRAMEWORKS):
+        if path in KEEP_FRAMEWORK_EXEC:
+            return True
         if path in KEEP_METALLIB or (path.endswith('.metallib') and size <= MAX_METALLIB):
             return True
         if re.search(r'/(XPCServices|Support|Helpers)/', path):
