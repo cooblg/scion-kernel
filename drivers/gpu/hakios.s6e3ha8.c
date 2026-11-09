@@ -584,6 +584,14 @@ panel_display(int on)
 	return ok ? 0 : EIO;
 }
 
+/* true while the panel's output is off by kern.hakios.display (drivers/input/hakios.input.c: touch_blank=1) */
+bool hakios_panel_display_off(void);
+bool
+hakios_panel_display_off(void)
+{
+	return panel_display_state == 0;
+}
+
 static int
 panel_sysctl_display(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
 {
