@@ -139,10 +139,7 @@ BIG_PROGRAM = 10 << 20           # daemons bigger than this (lskdd, ...) are not
 # ... but these are wanted all the same: locationd (31 MB), without which nothing in iOS has a location
 # -- Weather and its widget, Maps, the clock's cities' local weather -- and every app that asks for one
 # waits on a lookup that fails (userland/mkjobs.py runs it on demand; Scion gives it the phone's position)
-BIG_KEEP = ('usr/libexec/locationd',
-            # fairplayd.H2 (19 MB): akd's Anisette provisioning (ADIProvisioningEnd, error -42410, "No Anisette") and the
-            # store and account daemons look up com.apple.fairplayd and get "No such process" without it
-            'usr/sbin/fairplayd.H2')
+BIG_KEEP = ('usr/libexec/locationd',)
 # the executable of a daemon that lives inside a framework's bundle is not small (identityservicesd, 12 MB, past
 # SMALL): without it launchd's job for it points at nothing, and everything that looks up the identity services
 # (iMessage, FaceTime, the Apple ID's device registration) gets "No such process"
