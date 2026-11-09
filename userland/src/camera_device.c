@@ -1010,6 +1010,18 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 		say("%s: %ux%u made of every pixel in %.0f ms", out->name, width, height,
 		    (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6);
 	}
+	unsigned sample_y = 0, sample_c = 0;
+	bool sampled = out->delivered < 3 || out->delivered % 90 == 0;
+
+	if (sampled && pf != PF_BGRA) {
+		const uint8_t *yb = CVPixelBufferGetBaseAddressOfPlane(pb, 0), *cb = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+		size_t ys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), cs = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+
+		for (unsigned i = 0; i < 64; i++) {
+			sample_y += yb[(size_t)(height * (i / 8 + 1) / 9) * ys + (size_t)width * (i % 8 + 1) / 9] / 64;
+			sample_c += cb[(size_t)(height / 2 * (i / 8 + 1) / 9) * cs + ((size_t)width * (i % 8 + 1) / 9 & ~1u)] / 64;
+		}
+	}
 	CVPixelBufferUnlockBaseAddress(pb, 0);
 	CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
 	CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
@@ -1025,6 +1037,10 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 
 	CMTime pts = CMClockMakeHostTimeFromSystemUnits(f->time);
 
+	if (sampled) {
+		say("%s: picture %llu %ux%u %c%c%c%c, pts %.3f s, mean Y %u Cb %u (a sample)", out->name, (unsigned long long)out->delivered,
+		    width, height, pf >> 24, pf >> 16 & 255, pf >> 8 & 255, pf & 255, CMTimeGetSeconds(pts), sample_y, sample_c);
+	}
 	((pixel_buffer_handler)out->handler)(pb, pts);
 	/*
 	 * The moving picture's buffers are kept for HELD frames after they are given. The preview's pool
