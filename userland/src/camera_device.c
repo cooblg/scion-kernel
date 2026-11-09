@@ -1317,7 +1317,11 @@ worker(void *context)
 	float lux = -1, cct = -1;
 	struct af af = { 0 };
 	int device = open(HAKIOS_CAMERA_DEVICE, O_RDWR), failures = 0;
+	mach_timebase_info_data_t tbi;
+	uint64_t t_start = 0, t_got = 0, t_an = 0, t_ren = 0, t_read = 0, t_win = 0;
+	unsigned t_n = 0;
 
+	mach_timebase_info(&tbi);
 	pthread_setname_np("hakios-camera");
 	if (device < 0) {
 		say("no %s (%s): no frames", HAKIOS_CAMERA_DEVICE, strerror(errno));
@@ -1353,7 +1357,9 @@ worker(void *context)
 			say("frames of %ux%u from the kernel (the %s)", head.width, head.height, s->camera->name);
 			continue;
 		}
+		t_start = mach_absolute_time();
 		n = read(device, buffer, bytes);
+		t_got = mach_absolute_time();
 		if (n != (ssize_t)bytes) {
 			if (n < 0 && errno == EIO) {
 				say("the kernel's camera has had a fault: no more frames");
@@ -1367,6 +1373,8 @@ worker(void *context)
 		const struct hakios_camera_frame *f = (const void *)buffer;
 		const uint8_t *raw = buffer + f->header_bytes;
 		struct hakios_camera_command c;
+
+		uint64_t t_a0 = mach_absolute_time();
 
 		isp_measure(&isp, f, raw, &st);
 		isp_awb(&isp, &st);
@@ -1413,6 +1421,8 @@ worker(void *context)
 			s->metadata = CFRetain(metadata);
 			pthread_mutex_unlock(&s->metadata_lock);
 		}
+		uint64_t t_r0 = mach_absolute_time();
+
 		pthread_mutex_lock(&s->lock);
 		for (int i = 0; s->graph_running && i < OUTPUTS; i++) {
 			struct output *out = &s->out[i];
@@ -1439,6 +1449,23 @@ worker(void *context)
 		pthread_mutex_unlock(&s->lock);
 		if (metadata != NULL) {
 			CFRelease(metadata);
+		}
+		{
+			uint64_t t_end = mach_absolute_time();
+
+			t_read += t_got - t_start;
+			t_an += t_r0 - t_a0;
+			t_ren += t_end - t_r0;
+			if (t_win == 0) {
+				t_win = t_start;
+			}
+			if (++t_n == 60) {
+				double k = (double)tbi.numer / tbi.denom / 1e6 / t_n;
+
+				say("timing, ms a frame: %.1f from the kernel (read, packing and waiting), %.1f measure/AWB/AF/metadata, %.1f render and hand-on; "
+				    "%.1f frames a second", t_read * k, (t_an) * k, t_ren * k, 1000.0 / ((t_end - t_win) * k));
+				t_n = 0; t_read = t_an = t_ren = 0; t_win = 0;
+			}
 		}
 		if (s->frames == 1 || s->frames % 300 == 0) {
 			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black; white balance R %.2f "
