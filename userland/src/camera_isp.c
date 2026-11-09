@@ -24,6 +24,7 @@ isp_init(struct isp *isp)
 	isp->wb[0] = isp->wb[1] = isp->wb[2] = 1;
 	isp->digital = 1;
 	isp->zoom = 1;
+	isp->bias = 1;
 	for (int i = 0; i < 3; i++) {
 		isp->ccm[i][i] = 1;
 	}
@@ -218,7 +219,7 @@ bool
 isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_stats *s, struct hakios_camera_command *c)
 {
 	double now = (double)f->exposure_lines * f->gain / f->gain_unity * isp->digital, ratio, want;
-	double target = 0.15 * WHITE, mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
+	double target = 0.15 * WHITE * (isp->bias > 0 ? isp->bias : 1), mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
 	double bright = s->bright * isp->digital;
 	uint32_t fast = f->frame_lines_min - f->margin, longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
 	uint32_t lines, gain, frame_lines = 0;

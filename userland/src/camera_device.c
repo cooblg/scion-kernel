@@ -446,6 +446,7 @@ struct stream {
 	unsigned        stills_wanted;  /* photographs asked for by StillImageCaptureNow, not yet given */
 	int             format_index;
 	double          min_fps, max_fps;
+	float           bias;           /* ExposureBias: the brightness slider, 1 (256) unchanged; 0 not set */
 	float           zoom;           /* ZoomFactor: the picture is the middle 1/zoom of the sensor each way */
 	const struct camera *camera;
 	CFStringRef     port;
@@ -668,6 +669,21 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 			say("stream: zoom %.2fx", zoom);
 		}
 		s->zoom = (float)zoom;
+		return 0;
+	}
+	if (key_is(key, "ExposureBias")) {
+		/* the brightness slider: the number is in 256ths of unity (256 as the stream starts): the aim is scaled by it */
+		double v = 256;
+
+		if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()) {
+			CFNumberGetValue(value, kCFNumberDoubleType, &v);
+		}
+		v = v / 256;
+		v = v < 0.25 ? 0.25 : v > 4 ? 4 : v;
+		if (fabs(v - (s->bias > 0 ? s->bias : 1)) > 0.01) {
+			say("stream: exposure bias x%.2f", v);
+		}
+		s->bias = (float)v;
 		return 0;
 	}
 	if (key_is(key, "MinimumFrameRate") || key_is(key, "MaximumFrameRate")) {
@@ -1390,8 +1406,21 @@ worker(void *context)
 		cct = cct < 0 ? colour_temperature(&isp) : cct * 0.97f + colour_temperature(&isp) * 0.03f;
 		isp_tune(&isp, lux, cct);
 		isp.zoom = s->zoom;
+		isp.bias = s->bias > 0 ? s->bias : 1;
 		isp.turned = s->camera->turned;
 		if (isp_ae(&isp, f, &st, &c)) {
+			(void)write(device, &c, sizeof(c));
+		} else if (isp.asked && s->frames % 10 == 0) {
+			/*
+			 * The kernel's own exposure takes back over two seconds after the last one asked for, and aims at
+			 * another level than this: the two took turns, which was a flicker. What was asked is asked again,
+			 * so that the kernel's exposure stays out of it while the camera is in use.
+			 */
+			memset(&c, 0, sizeof(c));
+			c.command = HAKIOS_CAMERA_EXPOSURE;
+			c.a = isp.asked_lines;
+			c.b = isp.asked_gain;
+			c.c = isp.asked_frame_lines;
 			(void)write(device, &c, sizeof(c));
 		}
 		if (s->af_now) {
