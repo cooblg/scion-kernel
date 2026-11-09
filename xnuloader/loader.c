@@ -892,6 +892,17 @@ static const struct platform platform_starlte = {
  * cannot tell them from the S9: the device's own image says which it is (loader_platform=, devices/<name>/mkimage.sh),
  * and without that they run as the S9. Written, not seen: nobody has run this on an S9+ or a Note9.
  */
+/*
+ * The Note9's (SM-N960): the S9's list, but its rkp_region is 0xAF600000 + 36 MB (the S9's: 0xAF800000 + 32 MB), which the
+ * S9's list would partly take (UEFI's map is the S9's: it can call those 2 MB at each end free); so the stretch from
+ * 0xAF000000 to 0xB1FFFFFF is left out whole, with a margin. On by default: the window of a 6 GB phone is the high bank's 4 GB
+ * only, and these ranges are 1.1 GB more of the low bank.
+ */
+static const uint64_t exynos9810_extra_ram_crown[][2] = {
+	{ 0x80200000, 0x8F000000 }, { 0x98000000, 0xAF000000 }, { 0xB2000000, 0xB8000000 }, { 0xB8200000, 0xC0000000 },
+	{ 0xC0080000, 0xCC000000 }, { 0xE3700000, 0xF0000000 }, { 0, 0 },
+};
+
 static const struct platform platform_star2lte = {
 	.name = "star2lte", .io_base = 0x10000000, .io_size = 0x10000000,
 	.gic_dist = 0x10101000, .gic_cpu = 0x10102000, .uart = 0,
@@ -918,7 +929,7 @@ static const struct platform platform_crownlte = {
 	.parked_cores = 0x2, .affinity_unreliable = 1,
 	.payload_home = 0xD0000000,
 	.keep_out = { { 0xF0000000, 0x0B200000, "CP: modem_if, cp_ram_logging" }, { 0xFB200000, 0x02800000, "ABOX: abox_rmem" } },
-	.extra_ram = exynos9810_extra_ram, .extra_ram_off = 1,   /* (seen on the S9 only: on this phone with extra_ram=1) */
+	.extra_ram = exynos9810_extra_ram_crown,   /* (on by default; extra_ram=0 turns it off) */
 	.sibling_of = &platform_starlte,
 };
 
@@ -4388,7 +4399,8 @@ choose_window(const struct payload_info *pi)
 	win_base = best_base;
 	win_size = best_size;
 	if (extra_ram_wanted(pi->cmdline)) {
-		extra_ram_keep_mfc = PLAT->extra_ram == exynos9810_extra_ram && mfc_wanted(pi->cmdline);
+		extra_ram_keep_mfc = (PLAT->extra_ram == exynos9810_extra_ram || PLAT->extra_ram == exynos9810_extra_ram_crown) &&
+		    mfc_wanted(pi->cmdline);
 		extra_ram_claim();
 	}
 	return 1;
