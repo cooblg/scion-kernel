@@ -226,9 +226,10 @@ drmCloseBufferHandle(int fd, uint32_t handle)
 	return drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &request);
 }
 
-/* Boot-args read once from kern.bootargs: bo_keepmap=1 (Mesa's buffer cache keeps a buffer's CPU mapping
+/* Boot-args read once from kern.bootargs: bo_keepmap (Mesa's buffer cache keeps a buffer's CPU mapping
    while the buffer waits in it: pan_bo.c, panfrost-keepmap.patch, so the next use needs no map call to the
-   kernel's driver) and bo_fastwait=1 (see wait_buffer()). */
+   kernel's driver) and bo_fastwait (see wait_buffer()). Both are ON unless the line says =0: the Note9's boot
+   line has no room for them (it held bo_keepmap=1 bo_fastwait=1 until 10 November 2026). */
 static int
 boot_flag(const char *flag)
 {
@@ -238,13 +239,20 @@ boot_flag(const char *flag)
 	return sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, flag) != NULL;
 }
 
+/* a flag that is on unless the line says NAME=0 */
+static int
+default_on(const char *off_flag)
+{
+	return !boot_flag(off_flag);
+}
+
 int
 hakios_drm_keep_maps(void)
 {
 	static int keep = -1;
 
 	if (keep < 0) {
-		keep = boot_flag("bo_keepmap=1");
+		keep = default_on("bo_keepmap=0");
 	}
 	return keep;
 }
@@ -401,7 +409,7 @@ fast_wait_on(void)
 	static int on = -1;
 
 	if (on < 0) {
-		on = boot_flag("bo_fastwait=1");
+		on = default_on("bo_fastwait=0");
 	}
 	return on;
 }

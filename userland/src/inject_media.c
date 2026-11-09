@@ -38,6 +38,8 @@
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
 #include <dlfcn.h>
+#include <signal.h>
+#include <sys/ucontext.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <mach/mach_time.h>
@@ -657,6 +659,76 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 	}
 }
 
+
+/*
+ * mediaserverd has been seen to die with SIGTRAP about nine seconds after the camera stops (10 November 2026), and this phone has no
+ * crash reporter. So the daemon says where it was: the fault's signal, the thread, and the frames from the program counter (and the link
+ * register, then the frame pointers' chain, kept inside the thread's own stack), each as image, symbol and offset where dyld knows
+ * them, else as the plain address (less the shared cache's slide, which `slide' holds, so that it can be looked up in the cache's
+ * symbols). Then the default action is put back and the fault happens again, as it would have done: nothing is hidden or
+ * handled.
+ */
+static void
+crash_handler(int sig, siginfo_t *info, void *context)
+{
+	ucontext_t *uc = context;
+	uintptr_t pc = 0, lr = 0, fp = 0, lo = 0, hi = 0;
+	pthread_t self = pthread_self();
+	char thread[64] = "?";
+
+	(void)info;
+	pthread_getname_np(self, thread, sizeof(thread));
+	if (uc != NULL && uc->uc_mcontext != NULL) {
+		pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+		lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(uc->uc_mcontext->__ss);
+		fp = (uintptr_t)__darwin_arm_thread_state64_get_fp(uc->uc_mcontext->__ss);
+	}
+	hi = (uintptr_t)pthread_get_stackaddr_np(self);
+	lo = hi - pthread_get_stacksize_np(self);
+	say("hakios: mediaserverd: CRASH, signal %d on thread '%s'; frames follow\n", sig, thread);
+	for (int i = 0; i < 40; i++) {
+		uintptr_t addr = i == 0 ? pc : i == 1 ? lr : 0;
+		Dl_info d;
+
+		if (i >= 2) {
+			if (fp < lo || fp + 16 > hi || (fp & 15) != 0) {
+				break;
+			}
+			addr = ((uintptr_t *)fp)[1];
+			fp = ((uintptr_t *)fp)[0];
+		}
+		if (addr == 0) {
+			continue;
+		}
+		if (dladdr((void *)addr, &d) && d.dli_fname != NULL) {
+			const char *base = strrchr(d.dli_fname, '/');
+
+			say("hakios: mediaserverd:   #%d %s %s+%lu (cache address %#lx)\n", i, base ? base + 1 : d.dli_fname,
+			    d.dli_sname ? d.dli_sname : "?", d.dli_sname ? (unsigned long)(addr - (uintptr_t)d.dli_saddr) : 0UL,
+			    (unsigned long)(addr - slide));
+		} else {
+			say("hakios: mediaserverd:   #%d %#lx (cache address %#lx)\n", i, (unsigned long)addr, (unsigned long)(addr - slide));
+		}
+	}
+	signal(sig, SIG_DFL);
+}
+
+static void
+crash_handler_arm(void)
+{
+	struct sigaction action;
+	static const int signals[] = { SIGTRAP, SIGSEGV, SIGBUS, SIGILL, SIGABRT };
+
+	memset(&action, 0, sizeof(action));
+	action.sa_sigaction = crash_handler;
+	action.sa_flags = SA_SIGINFO | SA_NODEFER | SA_RESETHAND;
+	sigemptyset(&action.sa_mask);
+	for (unsigned i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
+		sigaction(signals[i], &action, NULL);
+	}
+	say("hakios: mediaserverd: the crash reporter of ours is armed (SIGTRAP, SIGSEGV, SIGBUS, SIGILL, SIGABRT)\n");
+}
+
 __attribute__((constructor))
 static void
 hakios_media_init(void)
@@ -668,6 +740,7 @@ hakios_media_init(void)
 		return;
 	}
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
+	crash_handler_arm();
 	metal_left_alone = boot_arg("mediamtl=1");
 	if (metal_left_alone) {
 		say("hakios: mediaserverd: mediamtl=1: the capture stack may have the Metal device (it "
