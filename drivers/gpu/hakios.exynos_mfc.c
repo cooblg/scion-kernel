@@ -369,7 +369,7 @@ static uint32_t last_error;
  */
 #define MFC_INTID       (356 + 32)      /* the device tree's SPI 356 */
 extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
-static uint32_t irq_wanted;
+static uint32_t irq_wanted = 1;     /* the block's interrupt, unless mfc_irq=0 (the Note9's command line has no room for mfc_irq=1) */
 static bool irq_on;
 static volatile uint32_t irq_answer, irq_error;
 static uint64_t irq_count, irq_missed;
