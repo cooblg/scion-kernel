@@ -560,18 +560,27 @@ panel_display(int on)
 	static const uint8_t display_off[] = { 0x28 }, display_on[] = { 0x29 };
 	bool ok;
 
+	uint8_t before = 0xff, after = 0xff, mode_before = 0xff, mode_after = 0xff;
+	bool read_before, read_after;
+
 	if (dsim == 0 || panel_lock == NULL) {
 		return ENODEV;
 	}
 	lck_mtx_lock(panel_lock);
+	/* what the panel says of itself, before and 30 ms after: DCS 0A (power mode: bit 2 display on, bit 3 normal mode,
+	   bit 4 sleep out) and 0D (display mode): whether 28 changed anything there */
+	read_before = panel_read(0x0A, &before, 1) && panel_read(0x0D, &mode_before, 1);
 	ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(on ? display_on : display_off, 1);
 	ok = dsim_send(key_off, sizeof(key_off)) && ok;
 	if (ok) {
 		panel_display_state = on ? 1 : 0;
 	}
+	delay(30 * 1000);
+	read_after = panel_read(0x0A, &after, 1) && panel_read(0x0D, &mode_after, 1);
 	lck_mtx_unlock(panel_lock);
-	say("s6e3ha8: display %s (%s) (FIFOCTRL %x, INTSRC %x)\n", on ? "on (29)" : "off (28)", ok ? "sent" : "NOT SENT",
-	    rd(DSIM_FIFOCTRL), rd(DSIM_INTSRC));
+	say("s6e3ha8: display %s (%s) (FIFOCTRL %x, INTSRC %x); power mode 0A/0D before %s%02x/%02x, 30 ms after %s%02x/%02x\n",
+	    on ? "on (29)" : "off (28)", ok ? "sent" : "NOT SENT", rd(DSIM_FIFOCTRL), rd(DSIM_INTSRC),
+	    read_before ? "" : "(NOT READ) ", before, mode_before, read_after ? "" : "(NOT READ) ", after, mode_after);
 	return ok ? 0 : EIO;
 }
 
