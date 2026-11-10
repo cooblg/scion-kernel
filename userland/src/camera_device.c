@@ -1565,10 +1565,58 @@ stream_begin(CMBaseObjectRef o, bool graph)
 	return 0;
 }
 
+/*
+ * The stream's notifications. mediaserverd died with SIGTRAP ten seconds after every stop of the camera (seen 10 November 2026, by
+ * its own words: "-[BWGraph stop:]: Not all sink nodes became idle after waiting 10s"): the capture graph waits for the stream to say
+ * it has stopped, as the iPhone's ISP stream does (kFigCaptureStreamNotification_StreamStopped, and _StreamStarted when it begins),
+ * and ours said nothing. They are posted from another thread, as a device's would come, not from inside Start or Stop.
+ */
+struct stream_note {
+	CMBaseObjectRef stream;
+	const char *name;
+};
+
+static void
+post_note(void *context)
+{
+	struct stream_note *n = context;
+	CFStringRef *name = dlsym(RTLD_DEFAULT, n->name);
+	CFTypeRef (*centre)(void) = dlsym(RTLD_DEFAULT, "CMNotificationCenterGetDefaultLocalCenter");
+	OSStatus (*post)(CFTypeRef, CFStringRef, const void *, CFTypeRef) = dlsym(RTLD_DEFAULT, "CMNotificationCenterPostNotification");
+
+	if (name != NULL && *name != NULL && centre != NULL && post != NULL) {
+		OSStatus status = post(centre(), *name, n->stream, NULL);
+
+		say("stream: %s posted (%d)", n->name, (int)status);
+	} else {
+		say("stream: %s cannot be posted (no such symbol)", n->name);
+	}
+	CFRelease(n->stream);
+	free(n);
+}
+
+static void
+stream_note(CMBaseObjectRef o, const char *name)
+{
+	struct stream_note *n = malloc(sizeof(*n));
+
+	if (n == NULL) {
+		return;
+	}
+	n->stream = (CMBaseObjectRef)CFRetain(o);
+	n->name = name;
+	dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), n, post_note);
+}
+
 static OSStatus
 stream_start(CMBaseObjectRef o)
 {
-	return stream_begin(o, true);
+	OSStatus status = stream_begin(o, true);
+
+	if (status == 0) {
+		stream_note(o, "kFigCaptureStreamNotification_StreamStarted");
+	}
+	return status;
 }
 
 static OSStatus
@@ -1579,6 +1627,8 @@ stream_stop(CMBaseObjectRef o)
 	say("stream: stop (%llu frames, %llu pictures given)", (unsigned long long)s->frames,
 	    (unsigned long long)s->out[0].delivered);
 	pthread_mutex_lock(&s->lock);
+	bool was_running = s->graph_running;
+
 	s->graph_running = false;
 	for (int i = 0; i < OUTPUTS; i++) {
 		let_go(&s->out[i]);
@@ -1588,6 +1638,9 @@ stream_stop(CMBaseObjectRef o)
 	if (s->worker_started) {
 		pthread_join(s->worker, NULL);
 		s->worker_started = false;
+	}
+	if (was_running) {
+		stream_note(o, "kFigCaptureStreamNotification_StreamStopped");
 	}
 	return 0;
 }
