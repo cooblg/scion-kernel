@@ -1438,7 +1438,9 @@ sensors_thread(void *arg)
 				    strstr(arguments, "loader_platform=crownlte") != NULL;
 			}
 			if (mirrored) {
+				/* both in-plane axes: held upright, the S9's y said upside down (seen 10 November 2026, step 55) */
 				x = -x;
+				y = -y;
 			}
 
 			orientation_from(x, y, z, now_us);
