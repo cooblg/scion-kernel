@@ -1423,6 +1423,23 @@ sensors_thread(void *arg)
 		case HAKIOS_SENSOR_ACCEL: {
 			double k = (s.scale > 0 ? s.scale : 8) / 32768.0;
 			double x = -s.v[0] * k, y = -s.v[1] * k, z = -s.v[2] * k;  /* Android's sign to iOS's */
+			static int mirrored = -1;
+
+			/*
+			 * The Note9 (loader_platform=crownlte): with the S9's sensor position told to the hub, landscape came out
+			 * the wrong way round (seen 10 November 2026: the picture turned only when the phone was turned the other
+			 * way), portrait right. Its x is the other way: turned here.
+			 */
+			if (mirrored < 0) {
+				char arguments[1024] = "";
+				size_t size = sizeof(arguments) - 1;
+
+				mirrored = sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+				    strstr(arguments, "loader_platform=crownlte") != NULL;
+			}
+			if (mirrored) {
+				x = -x;
+			}
 
 			orientation_from(x, y, z, now_us);
 			if (sensor.accel != NULL) {
