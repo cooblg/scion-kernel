@@ -2479,7 +2479,12 @@ brightness_bridge(const char *arguments)
 	while (arg != NULL && arg != arguments && arg[-1] != ' ') {
 		arg = strstr(arg + 1, "brightness_bridge=");
 	}
-	if (arg == NULL || (mode = atoi(arg + 18)) <= 0) {
+	/* the Note9's boot line has no room: there brightness_bridge=2 and panel_blank=1 are the defaults (=0 turns each off) */
+	bool note9 = strstr(arguments, "loader_platform=crownlte") != NULL;
+
+	if (arg == NULL && note9) {
+		mode = 2;
+	} else if (arg == NULL || (mode = atoi(arg + 18)) <= 0) {
 		return;
 	}
 	library = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_LAZY);
@@ -2494,7 +2499,7 @@ brightness_bridge(const char *arguments)
 			    sel_registerName("alloc")), sel_registerName("init"));
 		}
 	}
-	panel_blank_on = strstr(arguments, "panel_blank=1") != NULL;
+	panel_blank_on = strstr(arguments, "panel_blank=1") != NULL || (note9 && strstr(arguments, "panel_blank=0") == NULL);
 	if (mode >= 2 && notify_register_check("com.apple.springboard.hasBlankedScreen", &brightness_blanked_token) !=
 	    NOTIFY_STATUS_OK) {
 		brightness_blanked_token = NOTIFY_TOKEN_INVALID;

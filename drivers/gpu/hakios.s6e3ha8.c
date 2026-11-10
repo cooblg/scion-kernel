@@ -603,7 +603,15 @@ hakios_panel_touch_blocked(uint32_t type, uint32_t finger)
 	bool dark;
 
 	if (gate < 0) {
-		gate = PE_parse_boot_argn("touch_blank", &on, sizeof(on)) && on != 0;
+		char platform[24] = "";
+
+		/* on by default on the Note9 (its boot line has no room for touch_blank=1); touch_blank=0 turns it off */
+		(void)PE_parse_boot_arg_str("loader_platform", platform, sizeof(platform));
+		if (PE_parse_boot_argn("touch_blank", &on, sizeof(on))) {
+			gate = on != 0;
+		} else {
+			gate = strcmp(platform, "crownlte") == 0;
+		}
 	}
 	dark = gate && panel_display_state == 0;
 	if (type == 1) {                        /* a finger lands: passed on unless the screen is dark */
