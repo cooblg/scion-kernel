@@ -15,3 +15,8 @@
 /redwood/bin/cpu_test 240 &
 # which processes take the processors, every 5 s in the log (src/cputop.c)
 /redwood/bin/cputop 5 &
+# what /private/var is, and why (src/var_check.c): early, and again after the console's busiest minute
+/redwood/bin/var_check
+/redwood/bin/rwtouch wait 60
+/redwood/bin/var_check
+/sbin/mount
