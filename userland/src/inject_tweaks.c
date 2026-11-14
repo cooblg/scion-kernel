@@ -429,3 +429,86 @@ __attribute__((used)) static const struct { const void *replacement, *replacee; 
 	{ (const void *)my_MGCopyAnswer, (const void *)MGCopyAnswer },
 	{ (const void *)my_MGCopyAnswerWithError, (const void *)MGCopyAnswerWithError },
 };
+
+/*
+ * MobileGestalt was not asked (seen 14 November 2026): Settings' storage reads the root volume's size from the file system.
+ * In Settings alone, a statfs that lands on the root volume (the system image) is given the disk's size as the iPhone's one
+ * container would have it: both volumes' blocks, and the kept volume's free space. Every path asked is said once.
+ */
+extern int statfs(const char *, struct statfs *);
+extern int fstatfs(int, struct statfs *);
+
+static int
+in_settings(void)
+{
+	static int is = -1;
+
+	if (is < 0) {
+		const char *name = getprogname();
+
+		is = name != NULL && strcmp(name, "Preferences") == 0;
+	}
+	return is;
+}
+
+static void
+fix_root(const char *what, struct statfs *sf)
+{
+	static CFMutableSetRef said;
+	struct statfs var;
+
+	if (!in_settings() || strcmp(sf->f_mntonname, "/") != 0) {
+		return;
+	}
+	if (said == NULL) {
+		said = CFSetCreateMutable(NULL, 0, &kCFTypeSetCallBacks);
+	}
+	if (said != NULL && what != NULL) {
+		CFStringRef k = CFStringCreateWithCString(NULL, what, kCFStringEncodingUTF8);
+
+		if (k != NULL && !CFSetContainsValue(said, k)) {
+			CFSetAddValue(said, k);
+			say("hakios: tweaks: Settings asks the size of the root volume through %s\n", what);
+		}
+		if (k != NULL) {
+			CFRelease(k);
+		}
+	}
+	if (statfs("/private/var", &var) != 0 || strcmp(var.f_fstypename, "hfs") != 0 || sf->f_bsize == 0) {
+		return;
+	}
+	unsigned long long var_blocks = (unsigned long long)var.f_blocks * var.f_bsize / sf->f_bsize;
+	unsigned long long var_free = (unsigned long long)var.f_bavail * var.f_bsize / sf->f_bsize;
+
+	sf->f_blocks += var_blocks;
+	sf->f_bfree = var_free;
+	sf->f_bavail = var_free;
+}
+
+static int
+my_statfs(const char *path, struct statfs *sf)
+{
+	int r = statfs(path, sf);
+
+	if (r == 0) {
+		fix_root(path, sf);
+	}
+	return r;
+}
+
+static int
+my_fstatfs(int fd, struct statfs *sf)
+{
+	int r = fstatfs(fd, sf);
+
+	if (r == 0) {
+		fix_root("fstatfs", sf);
+	}
+	return r;
+}
+
+__attribute__((used)) static const struct { const void *replacement, *replacee; } hakios_statfs_interposers[]
+    __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *)my_statfs, (const void *)statfs },
+	{ (const void *)my_fstatfs, (const void *)fstatfs },
+};
