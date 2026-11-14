@@ -415,6 +415,77 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
  * the codec's VCPHEVCRegisterEncoder is an empty function. It is registered here, as the codec
  * registers its decoder (VTRegisterVideoDecoderWithInfo, not hardware accelerated).
  */
+
+/*
+ * -[BWGraph stop:] waits ten seconds for its sink nodes to go idle and then traps, after logging which are still active
+ * (-[BWGraph _logActiveSinkNodesAfterGraphStopTimeout]) at a level this console never shows. That logging is ours instead:
+ * every sink node, its class and name, and for each input whether it has had its end of data, with the node above it.
+ */
+static const char *
+class_of(id o)
+{
+	return o != nil ? object_getClassName(o) : "nil";
+}
+
+static id
+send0(id o, const char *sel)
+{
+	SEL s = sel_registerName(sel);
+
+	if (o == nil || !((BOOL (*)(id, SEL, SEL))objc_msgSend)(o, sel_registerName("respondsToSelector:"), s)) {
+		return nil;
+	}
+	return ((id (*)(id, SEL))objc_msgSend)(o, s);
+}
+
+static void
+log_active_sinks(id self, SEL selector)
+{
+	Ivar iv = class_getInstanceVariable(object_getClass(self), "_sinkNodes");
+	id sinks = iv != NULL ? object_getIvar(self, iv) : nil;
+	id nodes = nil;
+
+	(void)selector;
+	say("hakios: mediaserverd: the graph's stop timed out; its sink nodes (%s):\n", class_of(sinks));
+	if (sinks == nil) {
+		return;
+	}
+	nodes = send0(sinks, "allObjects");
+	if (nodes == nil) {
+		nodes = sinks;
+	}
+	long n = ((long (*)(id, SEL))objc_msgSend)(nodes, sel_registerName("count"));
+
+	for (long i = 0; i < n; i++) {
+		id node = ((id (*)(id, SEL, long))objc_msgSend)(nodes, sel_registerName("objectAtIndex:"), i);
+		id name = send0(node, "name");
+		char nm[96] = "";
+		id inputs = send0(node, "inputs");
+		long ni = inputs != nil ? ((long (*)(id, SEL))objc_msgSend)(inputs, sel_registerName("count")) : 0;
+
+		if (name != nil) {
+			CFStringGetCString((CFStringRef)name, nm, sizeof(nm), kCFStringEncodingUTF8);
+		}
+		say("hakios: mediaserverd:   sink %ld: %s \"%s\", %ld inputs\n", i, class_of(node), nm, ni);
+		for (long j = 0; j < ni; j++) {
+			id in = ((id (*)(id, SEL, long))objc_msgSend)(inputs, sel_registerName("objectAtIndex:"), j);
+			id up = send0(in, "upstreamOutput");
+			id upnode = send0(up, "node");
+			id upname = send0(upnode, "name");
+			char un[96] = "";
+			Ivar eod = class_getInstanceVariable(object_getClass(in), "_receivedEOD");
+			int got = eod != NULL ? (int)*(BOOL *)((uint8_t *)(void *)in + ivar_getOffset(eod)) : -1;
+
+			if (upname != nil) {
+				CFStringGetCString((CFStringRef)upname, un, sizeof(un), kCFStringEncodingUTF8);
+			}
+			say("hakios: mediaserverd:     input %ld (%s): end of data %s; live format %s; from %s \"%s\", whose output's "
+			    "live format is %s\n", j, class_of(in), got < 0 ? "?" : got ? "received" : "NOT received",
+			    send0(in, "liveFormat") != nil ? "set" : "nil", class_of(upnode), un, send0(up, "liveFormat") != nil ? "set" : "nil");
+		}
+	}
+}
+
 static void
 register_hevc_encoder(void)
 {
@@ -506,6 +577,7 @@ static struct replacement {
 	  (IMP)quality_prioritization, &original_quality_prioritization, true, false },
 	{ "BWGNRNode", "renderSampleBuffer:forInput:", 0x1a1ec83b8UL, (IMP)gnr_render, NULL, true, false },
 	{ "BWNodeOutput", "emitSampleBuffer:", 0x1a1ea37e0UL, (IMP)emit_sample_buffer, &original_emit_sample_buffer, true, false },
+	{ "BWGraph", "_logActiveSinkNodesAfterGraphStopTimeout", 0x1a213a9f0UL, (IMP)log_active_sinks, NULL, true, false },
 };
 
 /* ---- the Metal device leaves this process before the capture stack asks for it -------------------- */
