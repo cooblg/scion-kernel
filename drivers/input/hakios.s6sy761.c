@@ -170,6 +170,7 @@ static uint32_t trace_left;
 
 /* hakios_touch_post() unless the panel is dark and touch_blank=1 says a touch is not to wake it (hakios.s6e3ha8.c) */
 extern bool hakios_panel_touch_blocked(uint32_t type, uint32_t finger);
+extern void hakios_w9018_init(void);
 
 static void
 touch_post_gated(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
@@ -453,6 +454,8 @@ hakios_s6sy761_init(void)
 {
 	uint32_t enabled = 0, steps = 6;
 	thread_t thread;
+
+	hakios_w9018_init();            /* the Note9's S Pen (hakios.w9018.c), started from here: hakios.input.c is patched */
 
 	if (!PE_parse_boot_argn("s6sy761", &enabled, sizeof(enabled)) || enabled == 0) {
 		return;

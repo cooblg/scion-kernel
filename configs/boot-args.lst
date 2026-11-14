@@ -262,7 +262,7 @@ keystore_kdf_kib	k
 keystore_real	k
 ksample	k
 ksample_us	k
-loader_platform	l
+loader_platform	klu
 loader_return_after	kl
 m3_diag	k
 m3_flush	k
@@ -350,6 +350,7 @@ net_names	k
 net_trace	k
 pan	k
 panel	k
+panel_blank	u
 panel_brightness	k
 panel_gamma	k
 panel_gamma_log	k
@@ -456,6 +457,7 @@ tmu_ungate	k
 torch	kl
 torch_max_s	k
 torch_secs	k
+touch_blank	k
 touch_fault	u
 touch_flip	k
 touch_lat	ku

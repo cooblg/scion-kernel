@@ -212,6 +212,10 @@ bool hakios_s6e3ha8_blank(__unused int (*say)(const char *, ...)) { return false
 bool hakios_panel_touch_blocked(__unused uint32_t type, __unused uint32_t finger) { return false; }
 #endif
 
+#ifndef HAKIOS_W9018
+void hakios_w9018_init(void) {}            /* no S Pen driver built */
+#endif
+
 #ifndef HAKIOS_EXYNOS_POWEROFF
 void hakios_exynos_halt_off(__unused boolean_t reboot) {}  /* a halt hands the phone to the loader, as it always did */
 #endif

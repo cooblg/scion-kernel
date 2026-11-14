@@ -2,13 +2,13 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **566 arguments**: 498 read by the kernel, 21 by the loader, 62 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **568 arguments**: 500 read by the kernel, 21 by the loader, 64 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list.
 
 Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl kern.bootargs`).
 
-## GPU and display (105)
+## GPU and display (107)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -91,6 +91,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `gpu_log` | K | `hakios.adreno.c` | `CONFIG_GPU_LOG` |  |
 | `gpu_recover` | K | `hakios.adreno.c` | `CONFIG_GPU_RECOVER` |  |
 | `gpu_va` | K | `hakios.adreno.c` | `CONFIG_GPU_VA` |  |
+| `loader_platform` | KLU | `hakios.exynos_poweroff.c`, `hakios.s6e3ha8.c`, `inject.c`, `inject_sb.c`, `loader.c` | `CONFIG_LOADER_PLATFORM` |  |
 | `mali` | K | `hakios.mali.c` | `CONFIG_MALI` |  |
 | `mali_acpm` | K | `hakios.mali.c` | `CONFIG_MALI_ACPM` |  |
 | `mali_fastmap` | K | `hakios.mali.c` | `CONFIG_MALI_FASTMAP` |  |
@@ -115,6 +116,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `surf_wrap` | K | `MiniIOSurface.cpp` | `CONFIG_SURF_WRAP` |  |
 | `surftrace` | K | `MiniIOSurface.cpp` | `CONFIG_SURFTRACE` |  |
 | `surftrace_of` | K | `MiniIOSurface.cpp` | `CONFIG_SURFTRACE_OF` |  |
+| `touch_blank` | K | `hakios.s6e3ha8.c` | `CONFIG_TOUCH_BLANK` |  |
 | `touch_lat` | KU | `MiniIOMobileFramebuffer.cpp`, `eagl.c`, `hakios.goodix.c`, `hakios.gpu.cpp`, `hakios.input.c`, `inject.c`, `inject_sb.c` | `CONFIG_TOUCH_LAT` |  |
 | `vblur` | U | `eagl.c` | `CONFIG_VBLUR` |  |
 
@@ -536,7 +538,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `ustacks_threads` | K | `user_exception_trace.c` | `CONFIG_USTACKS_THREADS` |  |
 | `ustacks_tname` | K | `user_exception_trace.c` | `CONFIG_USTACKS_TNAME` |  |
 
-## Loader (12)
+## Loader (11)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -546,14 +548,13 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `cpus` | L | `loader.c` | `CONFIG_CPUS` |  |
 | `extra_ram` | KL | `1512-arm-extra-ram.patch`, `loader.c` | `CONFIG_EXTRA_RAM` |  |
 | `gamut` | L | `loader.c` | `CONFIG_GAMUT` |  |
-| `loader_platform` | L | `loader.c` | `CONFIG_LOADER_PLATFORM` |  |
 | `mfc` | KL | `hakios.exynos_mfc.c`, `loader.c` | `CONFIG_MFC` |  |
 | `recovery` | L | `loader.c` | `CONFIG_RECOVERY` |  |
 | `serial` | L | `loader.c` | `CONFIG_SERIAL` |  |
 | `ufs_probe` | L | `loader.c` | `CONFIG_UFS_PROBE` |  |
 | `wdt` | L | `loader.c` | `CONFIG_WDT` |  |
 
-## User space (106)
+## User space (107)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -631,6 +632,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `mfc_mif_khz` | K | `hakios.exynos_mfc.c` | `CONFIG_MFC_MIF_KHZ` |  |
 | `mfc_zc` | K | `hakios.exynos_mfc.c` | `CONFIG_MFC_ZC` |  |
 | `pan` | K | `1509-m3-diag-and-pan-off.patch` | `CONFIG_PAN` |  |
+| `panel_blank` | U | `inject_sb.c` | `CONFIG_PANEL_BLANK` |  |
 | `passcode_debug` | U | `passcoded.m` | `CONFIG_PASSCODE_DEBUG` |  |
 | `passcode_reset` | K | `MiniAppleKeyStore.cpp` | `CONFIG_PASSCODE_RESET` |  |
 | `passcode_selftest` | K | `MiniAppleKeyStore.cpp` | `CONFIG_PASSCODE_SELFTEST` |  |
@@ -655,7 +657,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `tee_probe` | K | `hakios.exynos_tee.c` | `CONFIG_TEE_PROBE` |  |
 | `touch_fault` | U | `inject.c` | `CONFIG_TOUCH_FAULT` |  |
 | `ucache_trap` | K | `1511-m3-user-cache-pou.patch` | `CONFIG_UCACHE_TRAP` |  |
-| `var_hfs` | U | `init.c` | `CONFIG_VAR_HFS` |  |
+| `var_hfs` | U | `init.c`, `var_check.c` | `CONFIG_VAR_HFS` |  |
 | `var_seed` | U | `init.c` | `CONFIG_VAR_SEED` |  |
 | `var_store` | U | `init.c` | `CONFIG_VAR_STORE` |  |
 | `vgpu_height` | K | `hakios.vgpu.c` | `CONFIG_VGPU_HEIGHT` |  |
