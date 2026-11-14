@@ -811,9 +811,12 @@ audio_source_stop(id self, SEL selector, id *error)
 {
 	BOOL r = ((BOOL (*)(id, SEL, id *))original_audio_source_stop)(self, selector, error);
 
+	/*
+	 * At once, inside the stop, while the graph is still whole: a delayed end (it was half a second) landed after a quick
+	 * photo/video switch had torn the graph down, and its end-of-data marker went to a freed node (SIGSEGV, 14 November).
+	 */
 	CFRetain((CFTypeRef)self);
-	dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
-	    (void *)self, audio_source_end);
+	audio_source_end((void *)self);
 	return r;
 }
 
