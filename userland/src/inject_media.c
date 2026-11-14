@@ -577,7 +577,6 @@ static struct replacement {
 	  (IMP)quality_prioritization, &original_quality_prioritization, true, false },
 	{ "BWGNRNode", "renderSampleBuffer:forInput:", 0x1a1ec83b8UL, (IMP)gnr_render, NULL, true, false },
 	{ "BWNodeOutput", "emitSampleBuffer:", 0x1a1ea37e0UL, (IMP)emit_sample_buffer, &original_emit_sample_buffer, true, false },
-	{ "BWGraph", "_logActiveSinkNodesAfterGraphStopTimeout", 0x1a213a9f0UL, (IMP)log_active_sinks, NULL, true, false },
 };
 
 /* ---- the Metal device leaves this process before the capture stack asks for it -------------------- */
@@ -758,6 +757,22 @@ crash_handler(int sig, siginfo_t *info, void *context)
 	hi = (uintptr_t)pthread_get_stackaddr_np(self);
 	lo = hi - pthread_get_stacksize_np(self);
 	say("hakios: mediaserverd: CRASH, signal %d on thread '%s'; frames follow\n", sig, thread);
+	/*
+	 * The trap at the end of -[BWGraph stop:] (0x1a1f1fe60 in 20F66's cache) after its ten seconds: the graph is at x19 + 8
+	 * there (the stop's block), and its sink nodes are said before the process goes (log_active_sinks; the method that
+	 * would have logged them is a direct one, not replaceable through the runtime).
+	 */
+	if (pc - slide == 0x1a1f1fe60UL && uc != NULL && uc->uc_mcontext != NULL) {
+		uintptr_t x19 = (uintptr_t)uc->uc_mcontext->__ss.__x[19];
+
+		if (x19 != 0) {
+			id graph = *(id *)(x19 + 8);
+
+			if (graph != nil) {
+				log_active_sinks(graph, NULL);
+			}
+		}
+	}
 	for (int i = 0; i < 40; i++) {
 		uintptr_t addr = i == 0 ? pc : i == 1 ? lr : 0;
 		Dl_info d;
