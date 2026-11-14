@@ -37,6 +37,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <signal.h>
 #include <sys/ucontext.h>
@@ -744,12 +745,71 @@ wait_for_mfc(void *unused)
 	return NULL;
 }
 
+
+/*
+ * The microphone's source node does not mark its outputs ended when the graph stops it (seen 14 November 2026, at the stop's
+ * timeout: the movie's staging node had its video input ended and its audio input -- Audio Splitter (Back), from
+ * BWAudioSourceNode -- still live, so the movie file sink never went idle, the graph waited its ten seconds and trapped, and the
+ * movie was never finished). Its stop is wrapped: half a second after the node's own stop, every output of it still live is
+ * marked ended. A node that ended its outputs itself is left as it is.
+ */
+static IMP original_audio_source_stop;
+
+static void
+audio_source_end(void *context)
+{
+	id node = (id)context;
+	id outputs = send0(node, "outputs");
+	long n = outputs != nil ? ((long (*)(id, SEL))objc_msgSend)(outputs, sel_registerName("count")) : 0, ended = 0;
+
+	for (long i = 0; i < n; i++) {
+		id out = ((id (*)(id, SEL, long))objc_msgSend)(outputs, sel_registerName("objectAtIndex:"), i);
+
+		if (send0(out, "liveFormat") != nil) {
+			((void (*)(id, SEL))objc_msgSend)(out, sel_registerName("markEndOfLiveOutput"));
+			ended++;
+		}
+	}
+	say("hakios: mediaserverd: the audio source stopped: %ld of its %ld outputs still live, marked ended\n", ended, n);
+	CFRelease((CFTypeRef)node);
+}
+
+static BOOL
+audio_source_stop(id self, SEL selector, id *error)
+{
+	BOOL r = ((BOOL (*)(id, SEL, id *))original_audio_source_stop)(self, selector, error);
+
+	CFRetain((CFTypeRef)self);
+	dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+	    (void *)self, audio_source_end);
+	return r;
+}
+
+static void
+wrap_audio_source_stop(void)
+{
+	static bool done;
+	Class cls;
+	Method m;
+	SEL sel = sel_registerName("stop:");
+
+	if (done || (cls = objc_getClass("BWAudioSourceNode")) == Nil || (m = class_getInstanceMethod(cls, sel)) == NULL) {
+		return;
+	}
+	done = true;
+	original_audio_source_stop = method_getImplementation(m);
+	/* on BWAudioSourceNode itself (added there if it inherits stop:), never on its superclass */
+	class_replaceMethod(cls, sel, (IMP)audio_source_stop, method_getTypeEncoding(m));
+	say("hakios: mediaserverd: -[BWAudioSourceNode stop:] wrapped (its outputs marked ended after a stop)\n");
+}
+
 static void
 image_added(__unused const struct mach_header *header, __unused intptr_t image_slide)
 {
 	/* before anything of the image that was just added runs, and this is the only place in this
 	 * library that is told about a new image at all */
 	keep_metal_from_the_capture_stack();
+	wrap_audio_source_stop();
 	for (size_t i = 0; i < sizeof(replacements) / sizeof(replacements[0]); i++) {
 		struct replacement *r = &replacements[i];
 		Class cls;
