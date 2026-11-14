@@ -759,7 +759,7 @@ extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFInd
 #define FIELD_IS_BUILT_IN               0x4
 #define FIELD_DIGITIZER_DISPLAY_INTEGRATED 0xb0019
 
-#define MAX_FINGERS     10
+#define MAX_FINGERS     12      /* 0-9 the touch screen, 11 the S Pen (hakios.w9018.c) */
 
 /*
  * A finger that lands this close to an edge of the screen (a fraction of the width or the height)
