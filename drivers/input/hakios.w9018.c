@@ -75,6 +75,8 @@ say(const char *format, ...)
 #define QUERY_POS               14
 #define PACKET_BYTES            14
 
+#define PRESS_ON                40              /* of 4095: a press, not the hover's noise */
+#define RELEASE_PACKETS         4               /* about 30 ms at 133 a second */
 #define MAX_X                   14563
 #define MAX_Y                   7085
 
@@ -189,9 +191,12 @@ pen_thread(void *param, __unused wait_result_t wr)
 		uint32_t wx = (uint32_t)p[1] << 8 | p[2], wy = (uint32_t)p[3] << 8 | p[4];
 		uint32_t pressure = (uint32_t)p[5] << 8 | p[6];
 
-		if (said < 300 || (packets % 2000) == 0) {
-			/* the raw bytes (the layout above is Samsung's driver's, and this firmware's numbers did not fit it) */
-			said++;
+		/*
+		 * The raw bytes while the tip presses (the first 400 such packets; and one in 500 of the rest): the hover's are
+		 * known (14 November: status 0x8n, pressure 0), a contact's carry 0x10 and a pressure.
+		 */
+		if (((p[0] & 0x10) || pressure > 0) ? said < 400 : (packets % 500) == 0) {
+			said += ((p[0] & 0x10) || pressure > 0) ? 1 : 0;
 			say("w9018: raw %llu: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
 			    (unsigned long long)packets, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13]);
 		}
@@ -202,7 +207,24 @@ pen_thread(void *param, __unused wait_result_t wr)
 		uint32_t ix = wx > max_x ? 0 : max_x - wx;
 		uint32_t sx = wy >= max_y ? 65535 : wy * 65535 / max_y;
 		uint32_t sy = ix >= max_x ? 65535 : ix * 65535 / max_x;
-		bool contact = prox && pressure > 0;
+		/*
+		 * Contact with hysteresis: down once the tip presses (0x10 with a pressure over PRESS_ON), up only after
+		 * RELEASE_PACKETS packets in a row with no pressure -- a pressure that flickered to 0 and back made touches
+		 * come and go, and the hover's noise touched in the air (14 November).
+		 */
+		static uint32_t zero_run;
+		bool pressing = (p[0] & 0x10) && pressure > PRESS_ON;
+		bool contact;
+
+		if (pressing) {
+			zero_run = 0;
+			contact = true;
+		} else if (down && ++zero_run < RELEASE_PACKETS) {
+			contact = true;
+		} else {
+			contact = false;
+		}
+		(void)prox;
 
 		if (contact && !down) {
 			down = true;

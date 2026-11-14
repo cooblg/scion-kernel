@@ -570,8 +570,32 @@ panel_display(int on)
 	/* what the panel says of itself, before and 30 ms after: DCS 0A (power mode: bit 2 display on, bit 3 normal mode,
 	   bit 4 sleep out) and 0D (display mode): whether 28 changed anything there */
 	read_before = panel_read(0x0A, &before, 1) && panel_read(0x0D, &mode_before, 1);
-	ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(on ? display_on : display_off, 1);
-	ok = dsim_send(key_off, sizeof(key_off)) && ok;
+	/*
+	 * Display-off alone (28) left the panel faintly lit (14-15 November: the screen grey-black, not off): its circuits
+	 * stay up. Off is now 28 then sleep-in (10), as Samsung's suspend sends them; on is sleep-out (11), its 120 ms, then
+	 * 29. The panel keeps its registers through a sleep (the brightness, TE), so nothing else is sent again.
+	 */
+	if (on) {
+		static const uint8_t sleep_out[] = { 0x11 };
+
+		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(sleep_out, 1);
+		ok = dsim_send(key_off, sizeof(key_off)) && ok;
+		lck_mtx_unlock(panel_lock);
+		delay(120 * 1000);              /* the sleep-out's own wait before the next command */
+		lck_mtx_lock(panel_lock);
+		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(display_on, 1) && ok;
+		ok = dsim_send(key_off, sizeof(key_off)) && ok;
+	} else {
+		static const uint8_t sleep_in[] = { 0x10 };
+
+		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(display_off, 1);
+		ok = dsim_send(key_off, sizeof(key_off)) && ok;
+		lck_mtx_unlock(panel_lock);
+		delay(20 * 1000);               /* a frame and more at 60 Hz */
+		lck_mtx_lock(panel_lock);
+		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(sleep_in, 1) && ok;
+		ok = dsim_send(key_off, sizeof(key_off)) && ok;
+	}
 	if (ok) {
 		panel_display_state = on ? 1 : 0;
 	}
@@ -579,7 +603,7 @@ panel_display(int on)
 	read_after = panel_read(0x0A, &after, 1) && panel_read(0x0D, &mode_after, 1);
 	lck_mtx_unlock(panel_lock);
 	say("s6e3ha8: display %s (%s) (FIFOCTRL %x, INTSRC %x); power mode 0A/0D before %s%02x/%02x, 30 ms after %s%02x/%02x\n",
-	    on ? "on (29)" : "off (28)", ok ? "sent" : "NOT SENT", rd(DSIM_FIFOCTRL), rd(DSIM_INTSRC),
+	    on ? "on (11, 29)" : "off (28, 10)", ok ? "sent" : "NOT SENT", rd(DSIM_FIFOCTRL), rd(DSIM_INTSRC),
 	    read_before ? "" : "(NOT READ) ", before, mode_before, read_after ? "" : "(NOT READ) ", after, mode_after);
 	return ok ? 0 : EIO;
 }

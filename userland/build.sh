@@ -188,7 +188,7 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 /redwood/lib/libhakios.sb.dylib SpringBoard MobilePhone InCallService
 /redwood/lib/libhakios.media.dylib mediaserverd
 /redwood/lib/libhakios.app.dylib Sileo
-/redwood/lib/libhakios.tweaks.dylib Preferences"}
+/redwood/lib/libhakios.tweaks.dylib Preferences installd"}
 [ -n "$BT" ] && INJECT="$INJECT
 /redwood/lib/libhakios.bluetool.dylib BlueTool
 /redwood/lib/libhakios.bluetoothd.dylib bluetoothd"
