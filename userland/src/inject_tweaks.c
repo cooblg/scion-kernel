@@ -34,6 +34,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
+#include <sys/attr.h>
 #include <unistd.h>
 
 /*
@@ -511,4 +512,165 @@ __attribute__((used)) static const struct { const void *replacement, *replacee; 
     __attribute__((section("__DATA,__interpose"))) = {
 	{ (const void *)my_statfs, (const void *)statfs },
 	{ (const void *)my_fstatfs, (const void *)fstatfs },
+};
+
+/*
+ * statfs was fixed and the header still said 4 GB (14 November 2026): the capacity comes through getattrlist (NSURL's volume
+ * capacity keys). In Settings alone, a getattrlist of a volume's space on the root volume gets the same both-volumes answer.
+ * Only the common case is touched: no common attributes but ATTR_CMN_RETURNED_ATTRS, and volume attributes of known sizes;
+ * anything else is said once and left as it is.
+ */
+extern int getattrlist(const char *, void *, void *, size_t, unsigned int);
+extern int fgetattrlist(int, void *, void *, size_t, unsigned int);
+
+/* the size in the packed buffer of each volume attribute bit (0: unknown here), in bit order */
+static int
+vol_attr_size(uint32_t bit)
+{
+	switch (bit) {
+	case ATTR_VOL_FSTYPE: case ATTR_VOL_SIGNATURE: case ATTR_VOL_IOBLOCKSIZE: case ATTR_VOL_OBJCOUNT:
+	case ATTR_VOL_FILECOUNT: case ATTR_VOL_DIRCOUNT: case ATTR_VOL_MAXOBJCOUNT: case ATTR_VOL_MOUNTFLAGS:
+		return 4;
+	case ATTR_VOL_SIZE: case ATTR_VOL_SPACEFREE: case ATTR_VOL_SPACEAVAIL: case ATTR_VOL_MINALLOCATION:
+	case ATTR_VOL_ALLOCATIONCLUMP: case ATTR_VOL_ENCODINGSUSED:
+#ifdef ATTR_VOL_SPACEUSED
+	case ATTR_VOL_SPACEUSED:
+#endif
+		return 8;
+	case ATTR_VOL_MOUNTPOINT: case ATTR_VOL_NAME: case ATTR_VOL_MOUNTEDDEVICE:
+		return (int)sizeof(attrreference_t);
+	case ATTR_VOL_CAPABILITIES:
+		return (int)sizeof(vol_capabilities_attr_t);
+	case ATTR_VOL_ATTRIBUTES:
+		return (int)sizeof(vol_attributes_attr_t);
+	case ATTR_VOL_INFO:
+		return -1;      /* asks for nothing itself */
+	default:
+		return 0;
+	}
+}
+
+static void
+fix_attrs(const char *what, int on_root, struct attrlist *al, void *buf, size_t size)
+{
+	static uint32_t said_masks[16];
+	static int nsaid;
+	struct statfs var, root;
+	uint8_t *p = buf, *end = (uint8_t *)buf + size;
+	uint32_t vol, cmn;
+	int known = 1;
+
+	if (!in_settings() || !on_root || al == NULL || buf == NULL || al->bitmapcount != ATTR_BIT_MAP_COUNT || al->volattr == 0) {
+		return;
+	}
+	cmn = al->commonattr;
+	vol = al->volattr;
+	if (cmn & ~(uint32_t)ATTR_CMN_RETURNED_ATTRS) {
+		known = 0;
+	}
+	if (size < 4) {
+		return;
+	}
+	p += 4;                                 /* the length */
+	if (cmn & ATTR_CMN_RETURNED_ATTRS) {
+		attribute_set_t set;
+
+		if (p + sizeof(set) > end) {
+			return;
+		}
+		memcpy(&set, p, sizeof(set));
+		vol = set.volattr;              /* only what came back is packed */
+		p += sizeof(set);
+	}
+	for (uint32_t bit = 1; bit != 0 && known; bit <<= 1) {
+		if ((vol & bit) && vol_attr_size(bit) == 0) {
+			known = 0;
+		}
+	}
+	int seen = 0;
+
+	for (int i = 0; i < nsaid; i++) {
+		seen |= said_masks[i] == (al->volattr ^ (known ? 0 : 0x80000000u));
+	}
+	if (!seen && nsaid < 16) {
+		said_masks[nsaid++] = al->volattr ^ (known ? 0 : 0x80000000u);
+		say("hakios: tweaks: Settings asks volume attributes %#x (common %#x) of the root volume through %s%s\n", al->volattr,
+		    al->commonattr, what, known ? "" : ": a layout not handled, left as it is");
+	}
+	if (!known || statfs("/private/var", &var) != 0 || strcmp(var.f_fstypename, "hfs") != 0 || statfs("/", &root) != 0) {
+		return;
+	}
+	long long data_cap = (long long)var.f_blocks * var.f_bsize, data_free = (long long)var.f_bavail * var.f_bsize;
+	long long sys_cap = (long long)root.f_blocks * root.f_bsize, sys_used = sys_cap - (long long)root.f_bfree * root.f_bsize;
+
+	for (uint32_t bit = 1; bit != 0; bit <<= 1) {
+		int n;
+		long long v;
+
+		if (!(vol & bit)) {
+			continue;
+		}
+		n = vol_attr_size(bit);
+		if (n < 0) {
+			continue;
+		}
+		if (p + n > end) {
+			return;
+		}
+		if (n == 8 && (bit == ATTR_VOL_SIZE || bit == ATTR_VOL_SPACEFREE || bit == ATTR_VOL_SPACEAVAIL
+#ifdef ATTR_VOL_SPACEUSED
+		    || bit == ATTR_VOL_SPACEUSED
+#endif
+		    )) {
+			v = bit == ATTR_VOL_SIZE ? data_cap + sys_cap : (bit == ATTR_VOL_SPACEFREE || bit == ATTR_VOL_SPACEAVAIL) ?
+			    data_free : data_cap + sys_cap - data_free;
+			(void)sys_used;
+			memcpy(p, &v, 8);
+		}
+		p += n;
+	}
+}
+
+static int
+on_root_path(const char *path)
+{
+	struct statfs sf;
+
+	return path != NULL && statfs(path, &sf) == 0 && strcmp(sf.f_mntonname, "/") == 0;
+}
+
+static int
+on_root_fd(int fd)
+{
+	struct statfs sf;
+
+	return fstatfs(fd, &sf) == 0 && strcmp(sf.f_mntonname, "/") == 0;
+}
+
+static int
+my_getattrlist(const char *path, void *al, void *buf, size_t size, unsigned int options)
+{
+	int r = getattrlist(path, al, buf, size, options);
+
+	if (r == 0 && in_settings()) {
+		fix_attrs("getattrlist", on_root_path(path), al, buf, size);
+	}
+	return r;
+}
+
+static int
+my_fgetattrlist(int fd, void *al, void *buf, size_t size, unsigned int options)
+{
+	int r = fgetattrlist(fd, al, buf, size, options);
+
+	if (r == 0 && in_settings()) {
+		fix_attrs("fgetattrlist", on_root_fd(fd), al, buf, size);
+	}
+	return r;
+}
+
+__attribute__((used)) static const struct { const void *replacement, *replacee; } hakios_attr_interposers[]
+    __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *)my_getattrlist, (const void *)getattrlist },
+	{ (const void *)my_fgetattrlist, (const void *)fgetattrlist },
 };
