@@ -438,52 +438,99 @@ send0(id o, const char *sel)
 	return ((id (*)(id, SEL))objc_msgSend)(o, s);
 }
 
+static id
+upstream_node(id in)
+{
+	id conn = send0(in, "connection"), out = nil;
+	const char *sels[] = { "output", "sourceOutput", "upstreamOutput", "producer" };
+
+	for (unsigned k = 0; out == nil && k < sizeof(sels) / sizeof(sels[0]); k++) {
+		out = send0(conn, sels[k]);
+	}
+	if (out == nil) {
+		out = send0(in, "upstreamOutput");
+	}
+	return send0(out, "node");
+}
+
+static void
+node_name(id node, char *nm, size_t size)
+{
+	id name = send0(node, "name");
+
+	nm[0] = 0;
+	if (name == nil || ((long (*)(id, SEL))objc_msgSend)(name, sel_registerName("length")) == 0) {
+		name = send0(node, "displayName");
+	}
+	if (name != nil) {
+		CFStringGetCString((CFStringRef)name, nm, (CFIndex)size, kCFStringEncodingUTF8);
+	}
+}
+
+/* a node, its inputs' and outputs' liveness, and (depth permitting) the nodes above each input; seen: printed already */
+static void
+walk_up(id node, int depth, CFMutableSetRef seen)
+{
+	char nm[96];
+	id inputs = send0(node, "inputs"), outputs = send0(node, "outputs");
+	long ni = inputs != nil ? ((long (*)(id, SEL))objc_msgSend)(inputs, sel_registerName("count")) : 0;
+	long no = outputs != nil ? ((long (*)(id, SEL))objc_msgSend)(outputs, sel_registerName("count")) : 0;
+	char live_in[40] = "", live_out[40] = "";
+
+	if (node == nil || CFSetContainsValue(seen, (const void *)node)) {
+		return;
+	}
+	CFSetAddValue(seen, (const void *)node);
+	node_name(node, nm, sizeof(nm));
+	for (long j = 0; j < ni && j < 32; j++) {
+		id in = ((id (*)(id, SEL, long))objc_msgSend)(inputs, sel_registerName("objectAtIndex:"), j);
+		live_in[j] = send0(in, "liveFormat") != nil ? 'L' : '.';
+	}
+	for (long j = 0; j < no && j < 32; j++) {
+		id out = ((id (*)(id, SEL, long))objc_msgSend)(outputs, sel_registerName("objectAtIndex:"), j);
+		live_out[j] = send0(out, "liveFormat") != nil ? 'L' : '.';
+	}
+	say("hakios: mediaserverd: %*s%s \"%s\": inputs [%s] outputs [%s] (L live, . ended)\n", 2 * depth + 2, "", class_of(node), nm,
+	    live_in, live_out);
+	if (depth >= 8) {
+		return;
+	}
+	for (long j = 0; j < ni; j++) {
+		id in = ((id (*)(id, SEL, long))objc_msgSend)(inputs, sel_registerName("objectAtIndex:"), j);
+
+		walk_up(upstream_node(in), depth + 1, seen);
+	}
+}
+
 static void
 log_active_sinks(id self, SEL selector)
 {
 	Ivar iv = class_getInstanceVariable(object_getClass(self), "_sinkNodes");
 	id sinks = iv != NULL ? object_getIvar(self, iv) : nil;
-	id nodes = nil;
+	CFMutableSetRef seen = CFSetCreateMutable(NULL, 0, NULL);
 
 	(void)selector;
-	say("hakios: mediaserverd: the graph's stop timed out; its sink nodes (%s):\n", class_of(sinks));
-	if (sinks == nil) {
+	say("hakios: mediaserverd: the graph's stop timed out; the sinks still live, and every node above them:\n");
+	if (sinks == nil || seen == NULL) {
 		return;
 	}
-	nodes = send0(sinks, "allObjects");
-	if (nodes == nil) {
-		nodes = sinks;
-	}
-	long n = ((long (*)(id, SEL))objc_msgSend)(nodes, sel_registerName("count"));
+	long n = ((long (*)(id, SEL))objc_msgSend)(sinks, sel_registerName("count"));
 
 	for (long i = 0; i < n; i++) {
-		id node = ((id (*)(id, SEL, long))objc_msgSend)(nodes, sel_registerName("objectAtIndex:"), i);
-		id name = send0(node, "name");
-		char nm[96] = "";
+		id node = ((id (*)(id, SEL, long))objc_msgSend)(sinks, sel_registerName("objectAtIndex:"), i);
 		id inputs = send0(node, "inputs");
 		long ni = inputs != nil ? ((long (*)(id, SEL))objc_msgSend)(inputs, sel_registerName("count")) : 0;
+		bool live = false;
 
-		if (name != nil) {
-			CFStringGetCString((CFStringRef)name, nm, sizeof(nm), kCFStringEncodingUTF8);
-		}
-		say("hakios: mediaserverd:   sink %ld: %s \"%s\", %ld inputs\n", i, class_of(node), nm, ni);
 		for (long j = 0; j < ni; j++) {
 			id in = ((id (*)(id, SEL, long))objc_msgSend)(inputs, sel_registerName("objectAtIndex:"), j);
-			id up = send0(in, "upstreamOutput");
-			id upnode = send0(up, "node");
-			id upname = send0(upnode, "name");
-			char un[96] = "";
-			Ivar eod = class_getInstanceVariable(object_getClass(in), "_receivedEOD");
-			int got = eod != NULL ? (int)*(BOOL *)((uint8_t *)(void *)in + ivar_getOffset(eod)) : -1;
-
-			if (upname != nil) {
-				CFStringGetCString((CFStringRef)upname, un, sizeof(un), kCFStringEncodingUTF8);
-			}
-			say("hakios: mediaserverd:     input %ld (%s): end of data %s; live format %s; from %s \"%s\", whose output's "
-			    "live format is %s\n", j, class_of(in), got < 0 ? "?" : got ? "received" : "NOT received",
-			    send0(in, "liveFormat") != nil ? "set" : "nil", class_of(upnode), un, send0(up, "liveFormat") != nil ? "set" : "nil");
+			live = live || send0(in, "liveFormat") != nil;
+		}
+		if (live) {
+			walk_up(node, 0, seen);
 		}
 	}
+	CFRelease(seen);
 }
 
 static void
