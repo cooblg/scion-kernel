@@ -40,6 +40,7 @@
 #include <stdarg.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern kern_return_t thread_terminate(thread_t thread);
 extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority,
     thread_t *new_thread);
 extern void loader_log_line(const char *line);
