@@ -280,6 +280,7 @@ hakios_tweaks_init(void)
  * numbers (and the two together as the disk's), when /private/var is that kept volume; otherwise it is left as it is.
  */
 extern CFTypeRef MGCopyAnswer(CFStringRef key, CFDictionaryRef options);
+extern CFTypeRef MGCopyAnswerWithError(CFStringRef key, CFDictionaryRef options, int *error);
 
 static void
 set_i64(CFMutableDictionaryRef d, CFStringRef key, long long v)
@@ -292,52 +293,139 @@ set_i64(CFMutableDictionaryRef d, CFStringRef key, long long v)
 	}
 }
 
+static CFNumberRef
+i64(long long v)
+{
+	return CFNumberCreate(NULL, kCFNumberLongLongType, &v);
+}
+
+/* the kept volume's numbers: 0 when /private/var is not it */
+static int
+kept_sizes(long long *data_cap, long long *data_free, long long *sys_cap, long long *sys_free)
+{
+	struct statfs root, var;
+
+	if (statfs("/private/var", &var) != 0 || strcmp(var.f_fstypename, "hfs") != 0 || statfs("/", &root) != 0) {
+		return 0;
+	}
+	*data_cap = (long long)var.f_blocks * var.f_bsize;
+	*data_free = (long long)var.f_bavail * var.f_bsize;
+	*sys_cap = (long long)root.f_blocks * root.f_bsize;
+	*sys_free = (long long)root.f_bavail * root.f_bsize;
+	return 1;
+}
+
+static void
+say_key_once(CFStringRef key, const char *how)
+{
+	static CFMutableSetRef said;
+	char name[96] = "";
+
+	if (said == NULL) {
+		said = CFSetCreateMutable(NULL, 0, &kCFTypeSetCallBacks);
+	}
+	if (said == NULL || CFSetContainsValue(said, key)) {
+		return;
+	}
+	CFSetAddValue(said, key);
+	CFStringGetCString(key, name, sizeof(name), kCFStringEncodingUTF8);
+	say("hakios: tweaks: MobileGestalt asked for %s (%s) in %s\n", name, how, getprogname());
+}
+
+/* the answer to give instead, or NULL to give the real one */
+static CFTypeRef
+disk_answer(CFStringRef key, CFTypeRef real)
+{
+	long long dc, df, sc, sf;
+
+	if (key == NULL || CFGetTypeID(key) != CFStringGetTypeID()) {
+		return NULL;
+	}
+	if (CFStringFind(key, CFSTR("Disk"), 0).location != kCFNotFound || CFStringFind(key, CFSTR("Capacity"), 0).location !=
+	    kCFNotFound || CFStringFind(key, CFSTR("Available"), 0).location != kCFNotFound) {
+		say_key_once(key, real != NULL ? "answered" : "no answer");
+	}
+	if (!kept_sizes(&dc, &df, &sc, &sf)) {
+		return NULL;
+	}
+	if (CFEqual(key, CFSTR("DiskUsage")) && real != NULL && CFGetTypeID(real) == CFDictionaryGetTypeID()) {
+		CFMutableDictionaryRef d = CFDictionaryCreateMutableCopy(NULL, 0, real);
+
+		if (d == NULL) {
+			return NULL;
+		}
+		set_i64(d, CFSTR("TotalDataCapacity"), dc);
+		set_i64(d, CFSTR("TotalDataAvailable"), df);
+		set_i64(d, CFSTR("AmountDataAvailable"), df);
+		set_i64(d, CFSTR("TotalSystemCapacity"), sc);
+		set_i64(d, CFSTR("TotalSystemAvailable"), sf);
+		set_i64(d, CFSTR("TotalDiskCapacity"), dc + sc);
+		return d;
+	}
+	if (CFEqual(key, CFSTR("TotalDiskCapacity"))) {
+		return i64(dc + sc);
+	}
+	if (CFEqual(key, CFSTR("TotalDataCapacity"))) {
+		return i64(dc);
+	}
+	if (CFEqual(key, CFSTR("TotalDataAvailable")) || CFEqual(key, CFSTR("AmountDataAvailable"))) {
+		return i64(df);
+	}
+	if (CFEqual(key, CFSTR("TotalSystemCapacity"))) {
+		return i64(sc);
+	}
+	if (CFEqual(key, CFSTR("TotalSystemAvailable"))) {
+		return i64(sf);
+	}
+	return NULL;
+}
+
+/*
+ * Settings' storage (General > iPhone Storage) takes the capacity from MobileGestalt, which counts the root volume's
+ * container: the system image here (about 4 GB). /private/var is a volume of its own (HFS Plus, all of USERDATA, ~118 GB)
+ * that the iPhone's one APFS container would have held. So the disk's answers are the two volumes' together, when
+ * /private/var is that kept volume; every key with Disk, Capacity or Available in its name is said once, for finding
+ * the one that is read.
+ */
 static CFTypeRef
 my_MGCopyAnswer(CFStringRef key, CFDictionaryRef options)
 {
-	CFTypeRef v = MGCopyAnswer(key, options);
-	static int said;
-	struct statfs root, var;
+	CFTypeRef v = MGCopyAnswer(key, options), w = disk_answer(key, v);
 
-	if (key == NULL || !CFEqual(key, CFSTR("DiskUsage")) || v == NULL || CFGetTypeID(v) != CFDictionaryGetTypeID()) {
-		return v;
-	}
-	if (statfs("/private/var", &var) != 0 || strcmp(var.f_fstypename, "hfs") != 0 || statfs("/", &root) != 0) {
-		return v;
-	}
-	long long data_cap = (long long)var.f_blocks * var.f_bsize, data_free = (long long)var.f_bavail * var.f_bsize;
-	long long sys_cap = (long long)root.f_blocks * root.f_bsize, sys_free = (long long)root.f_bavail * root.f_bsize;
-	CFMutableDictionaryRef d = CFDictionaryCreateMutableCopy(NULL, 0, v);
-
-	if (d == NULL) {
-		return v;
-	}
-	if (!said) {
-		CFStringRef desc = CFCopyDescription(v);
-		char buf[400] = "";
-
-		if (desc != NULL) {
-			CFStringGetCString(desc, buf, sizeof(buf), kCFStringEncodingUTF8);
-			CFRelease(desc);
+	if (w != NULL) {
+		if (v != NULL) {
+			CFRelease(v);
 		}
-		say("hakios: tweaks: DiskUsage was %s\n", buf);
+		return w;
 	}
-	set_i64(d, CFSTR("TotalDataCapacity"), data_cap);
-	set_i64(d, CFSTR("TotalDataAvailable"), data_free);
-	set_i64(d, CFSTR("AmountDataAvailable"), data_free);
-	set_i64(d, CFSTR("TotalSystemCapacity"), sys_cap);
-	set_i64(d, CFSTR("TotalSystemAvailable"), sys_free);
-	set_i64(d, CFSTR("TotalDiskCapacity"), data_cap + sys_cap);
-	if (!said) {
-		said = 1;
-		say("hakios: tweaks: DiskUsage given the kept volume: data %lld of %lld, system %lld, disk %lld bytes\n", data_free,
-		    data_cap, sys_cap, data_cap + sys_cap);
+	return v;
+}
+
+static CFTypeRef
+my_MGCopyAnswerWithError(CFStringRef key, CFDictionaryRef options, int *error)
+{
+	CFTypeRef v = MGCopyAnswerWithError(key, options, error), w = disk_answer(key, v);
+
+	if (w != NULL) {
+		if (v != NULL) {
+			CFRelease(v);
+		}
+		if (error != NULL) {
+			*error = 0;
+		}
+		return w;
 	}
-	CFRelease(v);
-	return d;
+	return v;
+}
+
+__attribute__((constructor)) static void
+hakios_tweaks_mg_hello(void)
+{
+	say("hakios: tweaks: in %s (MobileGestalt's disk answers watched)\n", getprogname());
 }
 
 __attribute__((used)) static const struct { const void *replacement, *replacee; } hakios_mg_interposers[]
     __attribute__((section("__DATA,__interpose"))) = {
 	{ (const void *)my_MGCopyAnswer, (const void *)MGCopyAnswer },
+	{ (const void *)my_MGCopyAnswerWithError, (const void *)MGCopyAnswerWithError },
 };
