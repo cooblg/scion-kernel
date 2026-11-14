@@ -282,12 +282,21 @@ carve_floor(void)
 	return n_carved != 0 ? carved[n_carved - 1].at : (uint32_t)EXYNOS9810_MEM_SIZE(MFC);
 }
 
+static int carve_any(uint64_t bytes, uint64_t *phys);
+
 int
 hakios_mfc_carve(uint64_t bytes, uint64_t *phys)
 {
+	return zero_copy ? carve_any(bytes, phys) : -1;
+}
+
+/* from the top of the 128 MB down: the zero-copy surfaces', and the encoder's memory (which is not tied to an instance of the decoder's) */
+static int
+carve_any(uint64_t bytes, uint64_t *phys)
+{
 	uint32_t top = (uint32_t)EXYNOS9810_MEM_SIZE(MFC), need, i;
 
-	if (mem == NULL || carve_lock == NULL || !zero_copy || bytes == 0 || bytes > EXYNOS9810_MEM_SIZE(MFC)) {
+	if (mem == NULL || carve_lock == NULL || bytes == 0 || bytes > EXYNOS9810_MEM_SIZE(MFC)) {
 		return -1;
 	}
 	need = ROUND_UP((uint32_t)bytes, 4096);
@@ -311,6 +320,8 @@ hakios_mfc_carve(uint64_t bytes, uint64_t *phys)
 	return 0;
 }
 
+static void carve_free(uint64_t phys);
+
 int
 hakios_mfc_carved(uint64_t phys)
 {
@@ -319,6 +330,12 @@ hakios_mfc_carved(uint64_t phys)
 
 void
 hakios_mfc_uncarve(uint64_t phys)
+{
+	carve_free(phys);
+}
+
+static void
+carve_free(uint64_t phys)
 {
 	if (carve_lock == NULL) {
 		return;
@@ -1008,16 +1025,391 @@ self_test(void)
 
 /* ---- step 5: /dev/hakios-mfc ----------------------------------------------------------------------------------------------------- */
 
+/* ---- the encoder: H.264, /dev/hakios-mfcenc ------------------------------------------------------------------------------------- */
+
+/*
+ * From the same BSP (s5p_mfc_enc_param.c: mfc_set_default_params, mfc_set_enc_params, s5p_mfc_set_enc_params_h264; s5p_mfc_reg.c:
+ * s5p_mfc_set_enc_codec_buffers, _frame_buffer, _stream_buffer, _stride; s5p_mfc_inst.c: s5p_mfc_init_encode, _encode_one_frame;
+ * s5p_mfc_buf.c: mfc_calc_enc_codec_buffer_size; s5p_mfc_macros.h: the sizes; s5p_mfc.c: h264_enc_ctx 100 KB). Read for facts.
+ *   open           CODEC_TYPE 20 (H.264 encoder), the context (100 KB), OPEN_INSTANCE
+ *   the header     the parameters, the stream buffer and the source strides; SEQ_HEADER; SEQ_DONE_RET: E_STREAM_SIZE bytes of SPS and PPS
+ *                  (header mode 0: by themselves), E_NUM_DPB the reference frames wanted, E_MIN_SCRATCH_BUFFER_SIZE
+ *   the buffers    scratch, then each reference frame's luma, chroma and motion buffers; INIT_BUFFERS
+ *   a picture      E_SOURCE_FIRST/SECOND_ADDR, the stream buffer; NAL_START; FRAME_DONE_RET: E_STREAM_SIZE, E_SLICE_TYPE (1 I, 2 P)
+ * No B frames and parallel processing off (E_ENC_OPTIONS bit 18): each picture's access unit comes back for it, in order.
+ */
+#define E_CODEC_H264            20
+#define E_CTX                   0x19000u        /* 100 KB, page-rounded */
+#define E_STREAM                (4u << 20)
+#define E_FRAME_WIDTH           0xF770
+#define E_FRAME_HEIGHT          0xF774
+#define E_CROPPED_WIDTH         0xF778
+#define E_CROPPED_HEIGHT        0xF77C
+#define E_CROP_OFFSET           0xF780
+#define E_ENC_OPTIONS           0xF784
+#define E_PICTURE_PROFILE       0xF788
+#define E_VBV_BUFFER_SIZE       0xF78C
+#define E_VBV_INIT_DELAY        0xF790
+#define E_FIXED_PICTURE_QP      0xF794
+#define E_RC_CONFIG             0xF798
+#define E_RC_QP_BOUND           0xF79C
+#define E_RC_QP_BOUND_PB        0xF7A0
+#define E_RC_MODE               0xF7A4
+#define E_MB_RC_CONFIG          0xF7A8
+#define E_PADDING_CTRL          0xF7AC
+#define E_AIR_THRESHOLD         0xF7B0
+#define E_MV_HOR_RANGE          0xF7B4
+#define E_MV_VER_RANGE          0xF7B8
+#define E_HIGH_QUALITY_MODE     0xF7C0
+#define E_VIDEO_SIGNAL_TYPE     0xF7C4
+#define E_NUM_DPB               0xF890
+#define E_MIN_SCRATCH           0xF894
+#define E_LUMA_DPB              0xF8C0
+#define E_CHROMA_DPB            0xF904
+#define E_ME_BUFFER             0xF948
+#define E_SCRATCH_ADDR          0xF98C
+#define E_SCRATCH_SIZE          0xF990
+#define E_TMV_BUFFER0           0xF994
+#define E_TMV_BUFFER1           0xF998
+#define E_SOURCE_FIRST_ADDR     0xF9E0
+#define E_SOURCE_SECOND_ADDR    0xF9E4
+#define E_SOURCE_FIRST_STRIDE   0xF9EC
+#define E_SOURCE_SECOND_STRIDE  0xF9F0
+#define E_STREAM_ADDR           0xF9F8
+#define E_STREAM_SIZE_IN        0xF9FC
+#define E_ROI_BUFFER_ADDR       0xFA00
+#define E_PARAM_CHANGE          0xFA04
+#define E_IR_SIZE               0xFA08
+#define E_GOP_CONFIG            0xFA0C
+#define E_MSLICE_MODE           0xFA10
+#define E_MSLICE_SIZE_MB        0xFA14
+#define E_MSLICE_SIZE_BITS      0xFA18
+#define E_FRAME_INSERTION       0xFA1C
+#define E_RC_FRAME_RATE         0xFA20
+#define E_RC_BIT_RATE           0xFA24
+#define E_RC_ROI_CTRL           0xFA2C
+#define E_PICTURE_TAG           0xFA30
+#define E_BIT_COUNT_ENABLE      0xFA34
+#define E_MAX_BIT_COUNT         0xFA38
+#define E_MIN_BIT_COUNT         0xFA3C
+#define E_METADATA_ADDR         0xFA40
+#define E_METADATA_SIZE         0xFA44
+#define E_STREAM_OFFSET         0xFA58
+#define E_GOP_CONFIG2           0xFA5C
+#define E_WEIGHT_PREDICTION     0xFA60
+#define E_STREAM_SIZE           0xFA80
+#define E_SLICE_TYPE            0xFA84
+#define E_ASPECT_RATIO          0xFB4C
+#define E_EXTENDED_SAR          0xFB50
+#define E_H264_OPTIONS          0xFB54
+#define E_H264_OPTIONS_2        0xFB58
+#define E_H264_LF_ALPHA         0xFB5C
+#define E_H264_LF_BETA          0xFB60
+#define E_H264_REFRESH_PERIOD   0xFB64
+#define E_H264_FMO_NUM_GRP      0xFB6C
+#define E_H264_CHROMA_QP_OFFSET 0xFBA8
+#define E_NUM_T_LAYER           0xFBAC
+#define E_HIER_QP_LAYER0        0xFBB0
+#define E_HIER_BIT_LAYER0       0xFD18
+
+static struct {
+	int open, buffers;
+	uint32_t inst, width, height, stride, rows, dpb, scratch, luma, chroma, me;
+	uint64_t base_pa, codec_pa;             /* carved: context + stream + source; the codec's buffers */
+	uint32_t base_bytes, codec_bytes;
+	uint8_t *ctx, *stream, *src_y, *src_uv;
+	uint64_t frames, us_total;
+} E;
+
+static int enc_opens;
+
+static void
+enc_close(void)
+{
+	if (E.open) {
+		W(INSTANCE_ID, E.inst);
+		(void)expect(H2R_CLOSE_INSTANCE, R2H_CLOSE_INSTANCE, "encoder CLOSE_INSTANCE");
+		say("exynos_mfc: encoder: %llu pictures, %llu us each on average\n", E.frames, E.frames ? E.us_total / E.frames : 0);
+	}
+	if (E.codec_pa != 0) {
+		carve_free(E.codec_pa);
+	}
+	if (E.base_pa != 0) {
+		carve_free(E.base_pa);
+	}
+	bzero(&E, sizeof(E));
+}
+
+static void
+enc_stream_buffer(void)
+{
+	W(E_STREAM_ADDR, PA(E.stream));
+	W(E_STREAM_SIZE_IN, E_STREAM);
+	W(E_STREAM_OFFSET, 0);
+	W(E_SOURCE_FIRST_STRIDE, E.stride);
+	W(E_SOURCE_SECOND_STRIDE, E.stride);
+}
+
+/* the BSP's defaults, then this encoder's: H.264, variable bitrate with frame-level rate control, no B frames, no slices */
+static void
+enc_params(const struct hakios_mfc_enc_open *o)
+{
+	uint32_t fps = o->fps ? o->fps : 30, bitrate = o->bitrate ? o->bitrate : 10000000, gop = o->gop ? o->gop : fps;
+	uint32_t level = o->level ? o->level : 40, profile = o->profile <= HAKIOS_MFC_ENC_HIGH ? o->profile : HAKIOS_MFC_ENC_HIGH;
+	uint32_t h264;
+
+	W(E_FIXED_PICTURE_QP, 0);
+	W(E_MV_HOR_RANGE, 0x100);
+	W(E_MV_VER_RANGE, 0x100);
+	W(E_IR_SIZE, 0);
+	W(E_AIR_THRESHOLD, 0);
+	W(E_MSLICE_MODE, 0);
+	W(E_MSLICE_SIZE_MB, 0);
+	W(E_MSLICE_SIZE_BITS, 0);
+	W(E_RC_ROI_CTRL, 0x3FD00);
+	W(E_VBV_BUFFER_SIZE, 0);
+	W(E_VBV_INIT_DELAY, 0);
+	W(E_BIT_COUNT_ENABLE, 0);
+	W(E_MAX_BIT_COUNT, 10000);
+	W(E_MIN_BIT_COUNT, 1000);
+	W(E_HIGH_QUALITY_MODE, 0);
+	W(E_WEIGHT_PREDICTION, 0);
+	W(E_FRAME_INSERTION, 0);
+	W(E_ROI_BUFFER_ADDR, 0);
+	W(E_PARAM_CHANGE, 0);
+	W(E_PICTURE_TAG, 0);
+	W(E_METADATA_ADDR, 0);
+	W(E_METADATA_SIZE, 0);
+	W(E_PADDING_CTRL, 0);
+	W(E_MB_RC_CONFIG, 0);
+
+	W(E_FRAME_WIDTH, E.width);
+	W(E_FRAME_HEIGHT, E.height);
+	W(E_CROPPED_WIDTH, E.width);
+	W(E_CROPPED_HEIGHT, E.height);
+	W(E_CROP_OFFSET, 0);
+	/* frame skip off, header mode 0 (the SPS and PPS by themselves, at SEQ_HEADER), header on, parallel processing off */
+	W(E_ENC_OPTIONS, 1u << 18);
+	W(PIXEL_FORMAT, 0);                     /* NV12 */
+
+	/* rate control: frame level on (bit 9), MB level off, the first QP 26; variable bitrate */
+	W(E_RC_CONFIG, 0x4000u | (1u << 9) | 26u);
+	W(E_RC_BIT_RATE, bitrate);
+	W(E_RC_MODE, (0x12u & ~3u) | 2u);
+	W(E_RC_FRAME_RATE, (fps << 16) | 1u);
+	W(E_RC_QP_BOUND, (51u << 8) | 10u);
+	W(E_RC_QP_BOUND_PB, (51u << 24) | (10u << 16) | (51u << 8) | 10u);
+	W(E_FIXED_PICTURE_QP, (28u << 16) | (28u << 8) | 26u);
+
+	/* key frames: every gop pictures (I-frame control mode, bit 19), no B frames */
+	W(E_GOP_CONFIG, (gop & 0xFFFFu) | (1u << 19));
+	W(E_GOP_CONFIG2, (gop >> 16) & 0x3FFFu);
+
+	W(E_PICTURE_PROFILE, (level << 8) | profile);
+	/* CABAC for Main and High, the loop filter on, one reference, 8x8 transform for High, constraint_set0, SPS/PPS not repeated, no VUI */
+	h264 = (profile != HAKIOS_MFC_ENC_BASELINE ? 1u : 0u) | (profile == HAKIOS_MFC_ENC_HIGH ? (3u << 12) : 0u) | (1u << 26);
+	W(E_H264_OPTIONS, h264);
+	W(E_H264_OPTIONS_2, 0);                 /* picture order count type 0, no long-term references */
+	W(E_H264_LF_ALPHA, 0);
+	W(E_H264_LF_BETA, 0);
+	W(E_H264_REFRESH_PERIOD, 0);
+	W(E_H264_CHROMA_QP_OFFSET, 0);
+	W(E_H264_FMO_NUM_GRP, 0);
+	W(E_ASPECT_RATIO, 0);
+	W(E_EXTENDED_SAR, 0);
+	W(E_NUM_T_LAYER, 0x7u << 4);            /* no temporal layers */
+	for (uint32_t i = 0; i < 7; i++) {
+		W(E_HIER_QP_LAYER0 + 4 * i, 0);
+		W(E_HIER_BIT_LAYER0 + 4 * i, 0);
+	}
+	W(E_VIDEO_SIGNAL_TYPE, 0);
+}
+
+static int
+enc_open(struct hakios_mfc_enc_open *o)
+{
+	uint32_t y_bytes, uv_bytes, mbw, mbh, n;
+	uint64_t pa;
+	int error;
+
+	enc_close();
+	if (o->width < 64 || o->height < 64 || o->width > 4096 || o->height > 4096 || (o->width & 1) || (o->height & 1)) {
+		return EINVAL;
+	}
+	E.width = o->width;
+	E.height = o->height;
+	E.stride = ROUND_UP(E.width, 16);
+	E.rows = ROUND_UP(E.height, 32);
+	y_bytes = ROUND_UP(E.stride * E.rows, 4096);
+	uv_bytes = ROUND_UP(E.stride * (E.rows / 2), 4096);
+	E.base_bytes = E_CTX + E_STREAM + y_bytes + uv_bytes;
+	if (carve_any(E.base_bytes, &pa) != 0) {
+		say("exynos_mfc: encoder: no room for %u bytes\n", E.base_bytes);
+		return ENOMEM;
+	}
+	E.base_pa = pa;
+	E.ctx = mem + (pa - EXYNOS9810_MEM_MFC_PA);
+	E.stream = E.ctx + E_CTX;
+	E.src_y = E.stream + E_STREAM;
+	E.src_uv = E.src_y + y_bytes;
+	bzero(E.ctx, E_CTX);
+	bzero(E.src_y, y_bytes + uv_bytes);     /* (the rows below the picture, which the block reads, black-ish rather than stale) */
+
+	W(CODEC_TYPE, E_CODEC_H264);
+	W(CONTEXT_MEM_ADDR, PA(E.ctx));
+	W(CONTEXT_MEM_SIZE, E_CTX);
+	if ((error = expect(H2R_OPEN_INSTANCE, R2H_OPEN_INSTANCE, "encoder OPEN_INSTANCE")) != 0) {
+		enc_close();
+		return error;
+	}
+	E.inst = R(RET_INSTANCE_ID);
+	E.open = 1;
+
+	enc_params(o);
+	enc_stream_buffer();
+	W(INSTANCE_ID, E.inst);
+	if ((error = expect(H2R_SEQ_HEADER, R2H_SEQ_DONE, "encoder SEQ_HEADER")) != 0) {
+		enc_close();
+		return error;
+	}
+	n = R(E_STREAM_SIZE);
+	E.dpb = R(E_NUM_DPB);
+	E.scratch = ROUND_UP(R(E_MIN_SCRATCH), 256);
+	if (n == 0 || n > o->header_room || E.dpb == 0 || E.dpb > 16) {
+		say("exynos_mfc: encoder: the header: %u bytes (room %u), %u references, error %#x\n", n, o->header_room, E.dpb, last_error);
+		enc_close();
+		return EIO;
+	}
+	if ((error = copyout(E.stream, (user_addr_t)o->header, n)) != 0) {
+		enc_close();
+		return error;
+	}
+	o->header_bytes = n;
+
+	/* the codec's buffers: scratch, then each reference's luma, chroma, motion (mfc_calc_enc_codec_buffer_size) */
+	mbw = (E.width + 15) / 16;
+	mbh = (E.height + 15) / 16;
+	E.luma = ROUND_UP(((E.width + 63) / 64) * 64 * ((E.height + 31) / 32) * 32 + 64, 64);
+	E.chroma = ROUND_UP(((E.width + 63) / 64) * 64 * ((((E.height + 31) / 32) * 32) / 2) + 64, 64);
+	E.me = ROUND_UP(((mbw + 3) * (mbh + 3) * 8) + ((((mbw * mbh) + 63) / 64) * 32) + (((mbh * 64) + 2304) * (mbw + 7) / 8), 256);
+	E.codec_bytes = E.scratch + E.dpb * (E.luma + E.chroma + E.me);
+	if (carve_any(E.codec_bytes, &pa) != 0) {
+		say("exynos_mfc: encoder: no room for the codec's %u bytes\n", E.codec_bytes);
+		enc_close();
+		return ENOMEM;
+	}
+	E.codec_pa = pa;
+	uint32_t at = (uint32_t)pa;
+
+	W(E_SCRATCH_ADDR, at);
+	W(E_SCRATCH_SIZE, E.scratch);
+	at += E.scratch;
+	for (uint32_t i = 0; i < E.dpb; i++, at += E.luma) {
+		W(E_LUMA_DPB + 4 * i, at);
+	}
+	for (uint32_t i = 0; i < E.dpb; i++, at += E.chroma) {
+		W(E_CHROMA_DPB + 4 * i, at);
+	}
+	for (uint32_t i = 0; i < E.dpb; i++, at += E.me) {
+		W(E_ME_BUFFER + 4 * i, at);
+	}
+	W(E_TMV_BUFFER0, at);
+	W(E_TMV_BUFFER1, at);
+	W(INSTANCE_ID, E.inst);
+	if ((error = expect(H2R_INIT_BUFFERS, R2H_INIT_BUFFERS, "encoder INIT_BUFFERS")) != 0) {
+		enc_close();
+		return error;
+	}
+	E.buffers = 1;
+	say("exynos_mfc: encoder: %ux%u H.264 (profile %u, level %u), %u fps, %u b/s, key every %u; header %u bytes, %u references, scratch %u, "
+	    "%u + %u bytes carved\n", E.width, E.height, o->profile, o->level ? o->level : 40, o->fps ? o->fps : 30, o->bitrate ? o->bitrate : 10000000,
+	    o->gop ? o->gop : (o->fps ? o->fps : 30), n, E.dpb, E.scratch, E.base_bytes, E.codec_bytes);
+	return 0;
+}
+
+static int
+enc_frame(struct hakios_mfc_enc_frame *f)
+{
+	uint32_t answer, n, type;
+	uint64_t t0;
+	int error = 0;
+
+	if (!E.open || !E.buffers) {
+		return ENXIO;
+	}
+	if (f->y == 0 || f->uv == 0 || f->y_stride < E.width || f->uv_stride < E.width) {
+		return EINVAL;
+	}
+	for (uint32_t i = 0; i < E.height && error == 0; i++) {
+		error = copyin((user_addr_t)f->y + (uint64_t)i * f->y_stride, E.src_y + i * E.stride, E.width);
+	}
+	for (uint32_t i = 0; i < E.height / 2 && error == 0; i++) {
+		error = copyin((user_addr_t)f->uv + (uint64_t)i * f->uv_stride, E.src_uv + i * E.stride, E.width);
+	}
+	if (error != 0) {
+		return error;
+	}
+	__builtin_arm_dsb(15);
+	t0 = mach_absolute_time();
+	W(E_SOURCE_FIRST_ADDR, PA(E.src_y));
+	W(E_SOURCE_SECOND_ADDR, PA(E.src_uv));
+	enc_stream_buffer();
+	W(E_FRAME_INSERTION, f->key ? 1u : 0u);  /* 1: this picture an I frame */
+	W(E_PARAM_CHANGE, 0);
+	W(E_MSLICE_MODE, 0);
+	W(E_MSLICE_SIZE_MB, 0);
+	W(E_MSLICE_SIZE_BITS, 0);
+	W(E_PICTURE_TAG, (uint32_t)E.frames);
+	W(INSTANCE_ID, E.inst);
+	command(H2R_NAL_START);
+	answer = wait_answer(2000);
+	if (answer == 0) {
+		say("exynos_mfc: encoder: a picture: no answer in 2 s: the block is left alone from now on\n");
+		dead = 1;
+		return EIO;
+	}
+	if (answer != R2H_FRAME_DONE) {
+		say("exynos_mfc: encoder: a picture: answer %u, error %#x\n", answer, last_error);
+		return EIO;
+	}
+	n = R(E_STREAM_SIZE);
+	type = R(E_SLICE_TYPE);
+	if (n > f->stream_room || n > E_STREAM) {
+		return ENOSPC;
+	}
+	if (n != 0 && (error = copyout(E.stream, (user_addr_t)f->stream, n)) != 0) {
+		return error;
+	}
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	f->bytes = n;
+	f->key = type == 1;
+	f->us = (uint32_t)(ns / 1000);
+	E.frames++;
+	E.us_total += f->us;
+	if (E.frames <= 3 || (E.frames % 300) == 0) {
+		say("exynos_mfc: encoder: picture %llu: %u bytes, type %u, %u us\n", E.frames, n, type, f->us);
+	}
+	return 0;
+}
+
 static int mfc_opens;
 
 static int
-mfc_open(dev_t dev __unused, int flags __unused, int type __unused, proc_t p __unused)
+mfc_open(dev_t dev, int flags __unused, int type __unused, proc_t p __unused)
 {
 	int error = 0;
 
 	lck_mtx_lock(mfc_lock);
 	if (dead || !fw_up) {
 		error = EIO;
+	} else if (minor(dev) == 1) {
+		if (enc_opens != 0) {
+			error = EBUSY;
+		} else {
+			enc_opens = 1;
+		}
 	} else if (mfc_opens != 0) {
 		error = EBUSY;                  /* one client: VideoToolbox's next session stays in software */
 	} else {
@@ -1028,9 +1420,17 @@ mfc_open(dev_t dev __unused, int flags __unused, int type __unused, proc_t p __u
 }
 
 static int
-mfc_close(dev_t dev __unused, int flags __unused, int type __unused, proc_t p __unused)
+mfc_close(dev_t dev, int flags __unused, int type __unused, proc_t p __unused)
 {
 	lck_mtx_lock(mfc_lock);
+	if (minor(dev) == 1) {
+		if (!dead) {
+			enc_close();
+		}
+		enc_opens = 0;
+		lck_mtx_unlock(mfc_lock);
+		return 0;
+	}
 	if (!dead) {
 		inst_close();
 	}
@@ -1065,7 +1465,7 @@ frame_out(const struct mfc_result *r, struct hakios_mfc_decode *d)
 }
 
 static int
-mfc_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flag __unused, proc_t p __unused)
+mfc_ioctl(dev_t dev, u_long cmd, caddr_t data, int flag __unused, proc_t p __unused)
 {
 	int error = 0;
 
@@ -1073,6 +1473,21 @@ mfc_ioctl(dev_t dev __unused, u_long cmd, caddr_t data, int flag __unused, proc_
 	if (dead || !fw_up) {
 		lck_mtx_unlock(mfc_lock);
 		return EIO;
+	}
+	if (minor(dev) == 1) {
+		switch (cmd) {
+		case HAKIOS_MFC_ENC_OPEN:
+			error = enc_open((struct hakios_mfc_enc_open *)(void *)data);
+			break;
+		case HAKIOS_MFC_ENC_FRAME:
+			error = enc_frame((struct hakios_mfc_enc_frame *)(void *)data);
+			break;
+		default:
+			error = ENOTTY;
+			break;
+		}
+		lck_mtx_unlock(mfc_lock);
+		return error;
 	}
 	switch (cmd) {
 	case HAKIOS_MFC_OPEN: {
@@ -1218,6 +1633,12 @@ mfc_thread(void *arg __unused, wait_result_t w __unused)
 			say("exynos_mfc: 5: no /dev/hakios-mfc\n");
 		} else {
 			say("exynos_mfc: 5: /dev/hakios-mfc\n");
+			/* the encoder (minor 1): its own client, beside the decoder's */
+			if (devfs_make_node(makedev(major, 1), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-mfcenc") == NULL) {
+				say("exynos_mfc: 5: no /dev/hakios-mfcenc\n");
+			} else {
+				say("exynos_mfc: 5: /dev/hakios-mfcenc (the H.264 encoder)\n");
+			}
 		}
 	}
 out:
