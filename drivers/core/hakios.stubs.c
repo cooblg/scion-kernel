@@ -214,6 +214,7 @@ bool hakios_panel_touch_blocked(__unused uint32_t type, __unused uint32_t finger
 
 #ifndef HAKIOS_W9018
 void hakios_w9018_init(void) {}            /* no S Pen driver built */
+bool hakios_spen_near(__unused uint32_t *x, __unused uint32_t *y) { return false; }     /* no pen, no palm */
 #endif
 
 #ifndef HAKIOS_EXYNOS_POWEROFF

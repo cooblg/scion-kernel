@@ -24,18 +24,24 @@
  *   the axes     wacom,invert = <1 0 1>: x inverted, then x and y swapped -- the display's x is the digitizer's y, its y
  *                the digitizer's (max - x); max 14563 x 7085 (wacom,max_coords)
  *
- * The pen only ever adds a touch; the touch screen's driver is not changed. Not yet: palm rejection (the hand's touches
- * while the pen is near), hover, the side button, pressure.
+ * Palm rejection: while the pen is near (a coordinate packet, hover or contact, in the last NEAR_MS) the touch screen's
+ * fingers are dropped (hakios_spen_near(), asked by hakios.s6sy761.c), as Samsung's driver tells its touch screen to
+ * stop: the fingers holding the pen were taken for touches beside the tip (15 November: touches "in the air", up and
+ * left of the tip, and the pen's own taps lost among them). kern.hakios.spen_palm=0 turns it off.
+ * kern.hakios.spen_dx / spen_dy (of 65535, signed) shift the pen's point, to calibrate. Not yet: hover, the side
+ * button, pressure.
  *
  * Copyright (c) 2026 the HakiOS contributors. APSL 2.0.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
+#include <mach/mach_time.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.exynos_hsi2c.h>
 #include <sys/hakios.input.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <stdarg.h>
 
@@ -75,8 +81,10 @@ say(const char *format, ...)
 #define QUERY_POS               14
 #define PACKET_BYTES            14
 
-#define PRESS_ON                40              /* of 4095: a press, not the hover's noise */
-#define RELEASE_PACKETS         4               /* about 30 ms at 133 a second */
+#define PRESS_ON                24              /* of 4095: down; a press's first packet carries 30 or more */
+#define RELEASE_PACKETS         3               /* about 22 ms at 133 a second */
+#define NEAR_MS                 300             /* the pen counts as near this long after its last packet */
+#define RAW_SAID                120             /* raw packets said while pressed */
 #define MAX_X                   14563
 #define MAX_Y                   7085
 
@@ -94,6 +102,37 @@ static struct hakios_hsi2c bus = {
 
 static vm_offset_t alive;
 static uint32_t max_x = MAX_X, max_y = MAX_Y;
+
+SYSCTL_DECL(_kern_hakios);
+static int spen_palm = 1, spen_dx, spen_dy;
+SYSCTL_INT(_kern_hakios, OID_AUTO, spen_palm, CTLFLAG_RW | CTLFLAG_LOCKED, &spen_palm, 0,
+    "the touch screen's fingers dropped while the S Pen is near");
+SYSCTL_INT(_kern_hakios, OID_AUTO, spen_dx, CTLFLAG_RW | CTLFLAG_LOCKED, &spen_dx, 0, "the S Pen's x shift (of 65535)");
+SYSCTL_INT(_kern_hakios, OID_AUTO, spen_dy, CTLFLAG_RW | CTLFLAG_LOCKED, &spen_dy, 0, "the S Pen's y shift (of 65535)");
+
+static volatile uint64_t near_until;            /* mach_absolute_time() */
+static volatile uint32_t near_x, near_y;        /* the pen's last point, of 65535 */
+
+bool hakios_spen_near(uint32_t *x, uint32_t *y);
+
+bool
+hakios_spen_near(uint32_t *x, uint32_t *y)
+{
+	if (!spen_palm || mach_absolute_time() >= near_until) {
+		return false;
+	}
+	*x = near_x;
+	*y = near_y;
+	return true;
+}
+
+static uint32_t
+shift(uint32_t v, int by)
+{
+	int64_t r = (int64_t)v + by;
+
+	return r < 0 ? 0 : (r > 65535 ? 65535 : (uint32_t)r);
+}
 
 static inline uint32_t
 rd(vm_offset_t base, uint32_t off)
@@ -134,7 +173,7 @@ pen_thread(void *param, __unused wait_result_t wr)
 	uint8_t q[QUERY_BYTES], p[PACKET_BYTES];
 	bool down = false;
 	uint32_t last_x = 0, last_y = 0;
-	uint64_t packets = 0, touches = 0;
+	uint64_t packets = 0, touches = 0, near_ticks;
 
 	alive = ml_io_map(ALIVE_PA, 0x1000);
 	if (!alive || !hakios_hsi2c_map(&bus, say)) {
@@ -173,6 +212,7 @@ pen_thread(void *param, __unused wait_result_t wr)
 		thread_terminate(current_thread());
 		return;
 	}
+	nanoseconds_to_absolutetime((uint64_t)NEAR_MS * NSEC_PER_MSEC, &near_ticks);
 	error = chip_cmd(COM_SAMPLERATE_START);
 	say("w9018: 2: sampling started (%s)%s\n", error ? "refused" : "taken", steps < 3 ? "; packets said, nothing given to Darwin" :
 	    "; the pen's contact goes to Darwin as a touch");
@@ -195,7 +235,7 @@ pen_thread(void *param, __unused wait_result_t wr)
 		 * The raw bytes while the tip presses (the first 400 such packets; and one in 500 of the rest): the hover's are
 		 * known (14 November: status 0x8n, pressure 0), a contact's carry 0x10 and a pressure.
 		 */
-		if (((p[0] & 0x10) || pressure > 0) ? said < 400 : (packets % 500) == 0) {
+		if (((p[0] & 0x10) || pressure > 0) ? said < RAW_SAID : (packets % 2000) == 0) {
 			said += ((p[0] & 0x10) || pressure > 0) ? 1 : 0;
 			say("w9018: raw %llu: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
 			    (unsigned long long)packets, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13]);
@@ -205,15 +245,19 @@ pen_thread(void *param, __unused wait_result_t wr)
 		}
 		/* the display's axes: x inverted, then swapped (wacom,invert = <1 0 1>) */
 		uint32_t ix = wx > max_x ? 0 : max_x - wx;
-		uint32_t sx = wy >= max_y ? 65535 : wy * 65535 / max_y;
-		uint32_t sy = ix >= max_x ? 65535 : ix * 65535 / max_x;
+		uint32_t sx = shift(wy >= max_y ? 65535 : wy * 65535 / max_y, spen_dx);
+		uint32_t sy = shift(ix >= max_x ? 65535 : ix * 65535 / max_x, spen_dy);
+
+		near_x = sx;
+		near_y = sy;
+		near_until = mach_absolute_time() + near_ticks;
 		/*
-		 * Contact with hysteresis: down once the tip presses (0x10 with a pressure over PRESS_ON), up only after
-		 * RELEASE_PACKETS packets in a row with no pressure -- a pressure that flickered to 0 and back made touches
-		 * come and go, and the hover's noise touched in the air (14 November).
+		 * Contact with hysteresis: down once the tip presses (0x10 with a pressure over PRESS_ON), held while 0x10
+		 * stays (Samsung's BTN_TOUCH is 0x10 alone), up only after RELEASE_PACKETS packets in a row without it. The
+		 * 14 November log: no packet had a pressure without 0x10, a press's first carried 31 and then 86 and more.
 		 */
 		static uint32_t zero_run;
-		bool pressing = (p[0] & 0x10) && pressure > PRESS_ON;
+		bool pressing = (p[0] & 0x10) && (down || pressure > PRESS_ON);
 		bool contact;
 
 		if (pressing) {

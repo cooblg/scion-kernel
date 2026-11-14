@@ -171,6 +171,8 @@ static uint32_t trace_left;
 /* hakios_touch_post() unless the panel is dark and touch_blank=1 says a touch is not to wake it (hakios.s6e3ha8.c) */
 extern bool hakios_panel_touch_blocked(uint32_t type, uint32_t finger);
 extern void hakios_w9018_init(void);
+extern bool hakios_spen_near(uint32_t *x, uint32_t *y);
+static uint32_t palm_said;
 
 static void
 touch_post_gated(uint32_t type, uint32_t finger, uint32_t x, uint32_t y)
@@ -215,6 +217,22 @@ handle_event(const uint8_t *e)
 		nx = x >= res_x - 1 ? 65535 : x * 65535 / (res_x - 1);
 		ny = y >= res_y - 1 ? 65535 : y * 65535 / (res_y - 1);
 		stats.events++;
+		{
+			/* palm rejection: the S Pen near, a finger is the hand holding it (hakios.w9018.c) */
+			uint32_t px, py;
+
+			if (hakios_spen_near(&px, &py)) {
+				if (palm_said < 12) {
+					palm_said++;
+					say("s6sy761: finger %u dropped at %u,%u, the S Pen near at %u,%u (of 65535)\n", id, nx, ny, px, py);
+				}
+				if (finger_down[id]) {
+					finger_down[id] = false;
+					touch_post_gated(HAKIOS_TOUCH_UP, id, nx, ny);
+				}
+				return;
+			}
+		}
 		if (state == 3) {
 			if (finger_down[id]) {
 				finger_down[id] = false;
