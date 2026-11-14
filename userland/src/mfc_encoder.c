@@ -6,7 +6,7 @@
  * photographs' HEIC by inject_media.c). A video recording through that one took four to seven cores, fell behind, and at the stop
  * the movie was never finished (15 November 2026, 1080p and 720p alike).
  *
- * How: VideoToolbox's public compression API is interposed in this process. A session asked for H.264 ('avc1') is made as an HEVC
+ * How: CMCapture's pointers to VideoToolbox's public compression API are pointed here (patch_image). A session asked for H.264 ('avc1') is made as an HEVC
  * session underneath -- an object VideoToolbox knows, for the calls this file passes on (its pixel buffer pool, its properties) --
  * and every picture given to it is encoded by the block instead, synchronously: VTCompressionSessionEncodeFrame returns once the
  * picture's sample buffer has gone to the session's output callback. An HEVC ('hvc1') session is VideoToolbox's own, made as asked;
@@ -18,6 +18,10 @@
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 #include <CoreVideo/CoreVideo.h>
 #include <VideoToolbox/VideoToolbox.h>
 #include <errno.h>
@@ -753,22 +757,81 @@ hk_VTCompressionSessionEncodeFrameWithOutputHandler(VTCompressionSessionRef sess
 	return noErr;
 }
 
-__attribute__((used)) static const struct { const void *replacement, *replacee; } hakios_mfcenc_interposers[]
-    __attribute__((section("__DATA,__interpose"))) = {
-	{ (const void *)hk_VTCompressionSessionCreate, (const void *)VTCompressionSessionCreate },
-	{ (const void *)hk_VTCompressionSessionCreateWithOptions, (const void *)VTCompressionSessionCreateWithOptions },
-	{ (const void *)hk_VTCompressionSessionSetProperty, (const void *)VTCompressionSessionSetProperty },
-	{ (const void *)hk_VTCompressionSessionSetProperties, (const void *)VTCompressionSessionSetProperties },
-	{ (const void *)hk_VTCompressionSessionCopyProperty, (const void *)VTCompressionSessionCopyProperty },
-	{ (const void *)hk_VTSessionSetProperty, (const void *)VTSessionSetProperty },
-	{ (const void *)hk_VTSessionSetProperties, (const void *)VTSessionSetProperties },
-	{ (const void *)hk_VTSessionCopyProperty, (const void *)VTSessionCopyProperty },
-	{ (const void *)hk_VTCompressionSessionPrepareToEncodeFrames, (const void *)VTCompressionSessionPrepareToEncodeFrames },
-	{ (const void *)hk_VTCompressionSessionCompleteFrames, (const void *)VTCompressionSessionCompleteFrames },
-	{ (const void *)hk_VTCompressionSessionInvalidate, (const void *)VTCompressionSessionInvalidate },
-	{ (const void *)hk_VTCompressionSessionEncodeFrame, (const void *)VTCompressionSessionEncodeFrame },
-	{ (const void *)hk_VTCompressionSessionEncodeFrameWithOutputHandler, (const void *)VTCompressionSessionEncodeFrameWithOutputHandler },
+/* (an __interpose table did not reach CMCapture, inside the shared cache: see patch_image) */
+
+/*
+ * An __interpose table reaches calls from images outside the shared cache only: CMCapture's own calls (into VideoToolbox, both
+ * in the cache) never came through it (15 November, steps 77 and 78: not one session seen). CMCapture's stubs are
+ * `adrp x16, page; ldr x16, [x16, #off]; br x16`, through its pointers bound to VideoToolbox: each such pointer to one of the
+ * functions below is pointed at this file's instead, in this process's copy of the page.
+ */
+static const struct { const char *name; const void *replacement; } patches[] = {
+	{ "VTCompressionSessionCreate", (const void *)hk_VTCompressionSessionCreate },
+	{ "VTCompressionSessionCreateWithOptions", (const void *)hk_VTCompressionSessionCreateWithOptions },
+	{ "VTCompressionSessionEncodeFrame", (const void *)hk_VTCompressionSessionEncodeFrame },
+	{ "VTCompressionSessionEncodeFrameWithOutputHandler", (const void *)hk_VTCompressionSessionEncodeFrameWithOutputHandler },
+	{ "VTCompressionSessionCompleteFrames", (const void *)hk_VTCompressionSessionCompleteFrames },
+	{ "VTCompressionSessionInvalidate", (const void *)hk_VTCompressionSessionInvalidate },
+	{ "VTCompressionSessionPrepareToEncodeFrames", (const void *)hk_VTCompressionSessionPrepareToEncodeFrames },
+	{ "VTCompressionSessionSetProperty", (const void *)hk_VTCompressionSessionSetProperty },
+	{ "VTCompressionSessionSetProperties", (const void *)hk_VTCompressionSessionSetProperties },
+	{ "VTCompressionSessionCopyProperty", (const void *)hk_VTCompressionSessionCopyProperty },
+	{ "VTSessionSetProperty", (const void *)hk_VTSessionSetProperty },
+	{ "VTSessionSetProperties", (const void *)hk_VTSessionSetProperties },
+	{ "VTSessionCopyProperty", (const void *)hk_VTSessionCopyProperty },
 };
+#define NPATCHES (sizeof(patches) / sizeof(patches[0]))
+static const void *originals[NPATCHES];
+
+static void
+patch_image(const struct mach_header *mh, intptr_t slide)
+{
+	Dl_info info;
+	unsigned long size = 0;
+	int patched = 0;
+
+	(void)slide;
+	if (dladdr(mh, &info) == 0 || info.dli_fname == NULL || strstr(info.dli_fname, "/CMCapture.framework/CMCapture") == NULL) {
+		return;
+	}
+	const uint8_t *stubs = getsectiondata((const struct mach_header_64 *)mh, "__TEXT", "__stubs", &size);
+
+	if (stubs == NULL) {
+		say("CMCapture: no __stubs");
+		return;
+	}
+	for (unsigned long k = 0; k + 12 <= size; k += 12) {
+		const uint32_t *ins = (const uint32_t *)(stubs + k);
+		uintptr_t pc = (uintptr_t)ins;
+
+		if ((ins[0] & 0x9F00001Fu) != 0x90000010u || (ins[1] & 0xFFC003FFu) != 0xF9400210u || ins[2] != 0xD61F0200u) {
+			continue;               /* (not adrp x16 / ldr x16 / br x16) */
+		}
+		int64_t imm = (int64_t)((((ins[0] >> 5) & 0x7FFFF) << 2) | ((ins[0] >> 29) & 3));
+
+		if (imm & (1 << 20)) {
+			imm -= 1 << 21;
+		}
+		const void **slot = (const void **)((pc & ~(uintptr_t)0xFFF) + (uintptr_t)(imm << 12) + ((ins[1] >> 10) & 0xFFF) * 8);
+
+		for (unsigned i = 0; i < NPATCHES; i++) {
+			if (originals[i] == NULL || *slot != originals[i]) {
+				continue;
+			}
+			vm_address_t page = (vm_address_t)slot & ~(vm_address_t)(vm_page_size - 1);
+			kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+
+			if (kr != KERN_SUCCESS) {
+				say("CMCapture: %s's pointer at %p not writable (%d)", patches[i].name, (void *)slot, kr);
+				break;
+			}
+			*slot = patches[i].replacement;  /* (the page left writable: it may hold data CMCapture writes) */
+			patched++;
+			break;
+		}
+	}
+	say("CMCapture: %d of its pointers into VideoToolbox's compression now come here", patched);
+}
 
 __attribute__((constructor)) static void
 mfcenc_init(void)
@@ -776,5 +839,9 @@ mfcenc_init(void)
 	for (int i = 0; i < SESSIONS_MAX; i++) {
 		sessions[i].fd = -1;
 	}
+	for (unsigned i = 0; i < NPATCHES; i++) {
+		originals[i] = dlsym(RTLD_DEFAULT, patches[i].name);
+	}
+	_dyld_register_func_for_add_image(patch_image);         /* (also for every image already loaded) */
 	say("H.264 sessions go to the MFC when /dev/hakios-mfcenc is there (%s)", access("/dev/hakios-mfcenc", F_OK) == 0 ? "it is" : "it is not");
 }
