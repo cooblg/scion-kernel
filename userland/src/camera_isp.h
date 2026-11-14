@@ -95,6 +95,7 @@ float isp_sharpness(const struct hakios_camera_frame *f, const uint8_t *raw, flo
 /* the levels, from every 4th cell of every 4th pair of lines (with the processor's lens shading and white balance, if isp) */
 void isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, struct isp_stats *s);
 /* the exposure for the frames to come: true, and the command filled in, when it should change */
+extern void (*isp_say)(const char *format, ...);      /* where isp_ae says what it must (NULL: stderr) */
 bool isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_stats *s, struct hakios_camera_command *c);
 /*
  * The white balance: grey world -- of the nearly grey, when enough is -- kept to the line of the

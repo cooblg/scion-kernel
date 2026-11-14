@@ -15,8 +15,8 @@
 #include <stdio.h>
 #include "camera_isp.h"
 
-/* mediaserverd's log (camera_device.c) when it is there; camera_test has stderr */
-void hakios_camera_say(const char *format, ...) __attribute__((weak, format(printf, 1, 2)));
+/* mediaserverd's log (camera_device.c sets it); camera_test leaves it NULL and has stderr */
+void (*isp_say)(const char *format, ...);
 
 #define WHITE           959             /* 1023 less the black level of 64 */
 #define LUT_WHITE       3836            /* WHITE in the gamma table's steps */
@@ -241,8 +241,8 @@ isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_st
 		if (isp->stale_said < 4) {
 			isp->stale_said++;
 #define AE_STALE "AE: asked lines %u gain %u, the frames carry lines %u gain %u (of unity %u, max %u): going on from those"
-			if (hakios_camera_say != NULL) {
-				hakios_camera_say(AE_STALE, isp->asked_lines, isp->asked_gain, f->exposure_lines, f->gain, f->gain_unity, f->gain_max);
+			if (isp_say != NULL) {
+				isp_say(AE_STALE, isp->asked_lines, isp->asked_gain, f->exposure_lines, f->gain, f->gain_unity, f->gain_max);
 			} else {
 				fprintf(stderr, AE_STALE "\n", isp->asked_lines, isp->asked_gain, f->exposure_lines, f->gain, f->gain_unity,
 				    f->gain_max);

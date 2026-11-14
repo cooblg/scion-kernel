@@ -1421,7 +1421,8 @@ worker(void *context)
 		lux = lux < 0 ? lux_index(&isp, f) : lux * 0.9f + lux_index(&isp, f) * 0.1f;
 		cct = cct < 0 ? colour_temperature(&isp) : cct * 0.97f + colour_temperature(&isp) * 0.03f;
 		isp_tune(&isp, lux, cct);
-		isp.zoom = s->zoom;
+		isp_say = hakios_camera_say;
+	isp.zoom = s->zoom;
 		isp.bias = s->bias > 0 ? s->bias : 1;
 		isp.turned = s->camera->turned;
 		if (isp_ae(&isp, f, &st, &c)) {
