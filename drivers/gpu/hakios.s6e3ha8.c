@@ -553,6 +553,11 @@ SYSCTL_PROC(_kern_hakios, OID_AUTO, brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFL
  */
 static int panel_display_state = -1;
 
+/* sleep-in with display-off: off by default (the panel woke with black bands: its settings are not kept); kern.hakios.panel_sleep=1 tries it */
+static int panel_sleep;
+static bool panel_asleep;               /* put to sleep by panel_display(): the next on wakes it first */
+SYSCTL_INT(_kern_hakios, OID_AUTO, panel_sleep, CTLFLAG_RW | CTLFLAG_LOCKED, &panel_sleep, 0, "display-off also sleeps the panel");
+
 static int
 panel_display(int on)
 {
@@ -575,7 +580,7 @@ panel_display(int on)
 	 * stay up. Off is now 28 then sleep-in (10), as Samsung's suspend sends them; on is sleep-out (11), its 120 ms, then
 	 * 29. The panel keeps its registers through a sleep (the brightness, TE), so nothing else is sent again.
 	 */
-	if (on) {
+	if (on && panel_asleep) {
 		static const uint8_t sleep_out[] = { 0x11 };
 
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(sleep_out, 1);
@@ -585,7 +590,8 @@ panel_display(int on)
 		lck_mtx_lock(panel_lock);
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(display_on, 1) && ok;
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
-	} else {
+		panel_asleep = false;
+	} else if (!on && panel_sleep) {
 		static const uint8_t sleep_in[] = { 0x10 };
 
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(display_off, 1);
@@ -595,6 +601,11 @@ panel_display(int on)
 		lck_mtx_lock(panel_lock);
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(sleep_in, 1) && ok;
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
+		panel_asleep = ok;
+	} else {
+		/* 28 or 29 alone (the default: a panel woken from sleep-in came back with black bands top and bottom, 15 Nov) */
+		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(on ? display_on : display_off, 1);
+		ok = dsim_send(key_off, sizeof(key_off)) && ok;
 	}
 	if (ok) {
 		panel_display_state = on ? 1 : 0;
@@ -603,7 +614,7 @@ panel_display(int on)
 	read_after = panel_read(0x0A, &after, 1) && panel_read(0x0D, &mode_after, 1);
 	lck_mtx_unlock(panel_lock);
 	say("s6e3ha8: display %s (%s) (FIFOCTRL %x, INTSRC %x); power mode 0A/0D before %s%02x/%02x, 30 ms after %s%02x/%02x\n",
-	    on ? "on (11, 29)" : "off (28, 10)", ok ? "sent" : "NOT SENT", rd(DSIM_FIFOCTRL), rd(DSIM_INTSRC),
+	    on ? "on" : "off", ok ? "sent" : "NOT SENT", rd(DSIM_FIFOCTRL), rd(DSIM_INTSRC),
 	    read_before ? "" : "(NOT READ) ", before, mode_before, read_after ? "" : "(NOT READ) ", after, mode_after);
 	return ok ? 0 : EIO;
 }
