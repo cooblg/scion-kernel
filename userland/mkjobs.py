@@ -231,7 +231,10 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'soft
         # minutes, launchd with it at 25-33 %); amsengagementd asks for fairplayd, which this kernel cannot give, 76 times and
         # took 30-76 %. TEMPORARY for vmd: when cellular is brought up and CommCenter is taken out of the list above, take
         # 'voicemail' out with it (or try it first with ALLOW="voicemail CommCenter").
-        'voicemail', 'amsengagementd')
+        'voicemail', 'amsengagementd',
+        # fairplayd.H2 is in the full image (SYSTEM_FULL=1) and exits 0 the moment it starts (no FairPlay user client in
+        # this kernel); KeepAlive brought it back every 10 s for nothing (Note9, 14 November 2026)
+        'fairplayd')
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
