@@ -77,6 +77,7 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 static uintptr_t slide;
 static CFMutableSetRef ended_outputs;           /* outputs we marked ended: their later buffers are dropped */
 static pthread_mutex_t ended_lock = PTHREAD_MUTEX_INITIALIZER;
+static CFMutableSetRef stopped_sources;         /* audio source nodes stopped and not started again (under ended_lock) */
 
 /* +[BWCoreImageFilterRenderer prewarmPortraitFilterVersion:semanticStyleFilters:] */
 static void
@@ -277,8 +278,16 @@ static IMP original_audio_source_start;
 static BOOL
 audio_source_start(id self, SEL selector, id *error)
 {
-	BOOL started = ((BOOL (*)(id, SEL, id *))original_audio_source_start)(self, selector, error);
-	id made = error != NULL ? *error : NULL;
+	BOOL started;
+	id made;
+
+	pthread_mutex_lock(&ended_lock);
+	if (stopped_sources != NULL) {
+		CFSetRemoveValue(stopped_sources, (const void *)self);         /* running again */
+	}
+	pthread_mutex_unlock(&ended_lock);
+	started = ((BOOL (*)(id, SEL, id *))original_audio_source_start)(self, selector, error);
+	made = error != NULL ? *error : NULL;
 	static bool said;
 
 	if (started || made == NULL || ((long (*)(id, SEL))objc_msgSend)(made, sel_registerName("code")) != ERROR_NO_SUCH_THING) {
@@ -815,9 +824,43 @@ audio_source_stop(id self, SEL selector, id *error)
 	 * At once, inside the stop, while the graph is still whole: a delayed end (it was half a second) landed after a quick
 	 * photo/video switch had torn the graph down, and its end-of-data marker went to a freed node (SIGSEGV, 14 November).
 	 */
+	pthread_mutex_lock(&ended_lock);
+	if (stopped_sources == NULL) {
+		stopped_sources = CFSetCreateMutable(NULL, 0, NULL);
+	}
+	CFSetAddValue(stopped_sources, (const void *)self);
+	pthread_mutex_unlock(&ended_lock);
 	CFRetain((CFTypeRef)self);
 	audio_source_end((void *)self);
 	return r;
+}
+
+
+/*
+ * The source node's sample generator (-[BWAudioSourceNode _generateSamples], run by a timer) kept running after the stop and
+ * emitted into a graph already torn down -- the next session's start found mediaserverd dead of SIGSEGV in the emit (15
+ * November). A node stopped and not started again generates nothing.
+ */
+static IMP original_generate_samples;
+
+static void
+generate_samples(id self, SEL selector)
+{
+	bool stopped;
+
+	pthread_mutex_lock(&ended_lock);
+	stopped = stopped_sources != NULL && CFSetContainsValue(stopped_sources, (const void *)self);
+	pthread_mutex_unlock(&ended_lock);
+	if (stopped) {
+		static bool said;
+
+		if (!said) {
+			said = true;
+			say("hakios: mediaserverd: the audio source's generator ran after its stop: nothing generated\n");
+		}
+		return;
+	}
+	((void (*)(id, SEL))original_generate_samples)(self, selector);
 }
 
 static void
@@ -836,6 +879,22 @@ wrap_audio_source_stop(void)
 	/* on BWAudioSourceNode itself (added there if it inherits stop:), never on its superclass */
 	class_replaceMethod(cls, sel, (IMP)audio_source_stop, method_getTypeEncoding(m));
 	say("hakios: mediaserverd: -[BWAudioSourceNode stop:] wrapped (its outputs marked ended after a stop)\n");
+	{
+		SEL g = sel_registerName("_generateSamples");
+		Method gm = class_getInstanceMethod(cls, g);
+		const char *types = gm != NULL ? method_getTypeEncoding(gm) : NULL;
+
+		const char *colon = types != NULL ? strchr(types, ':') : NULL;
+		bool no_args = colon != NULL && colon[1] != 0 && strspn(colon + 1, "0123456789") == strlen(colon + 1);
+
+		if (gm != NULL && types != NULL && types[0] == 'v' && no_args) {
+			original_generate_samples = method_getImplementation(gm);
+			class_replaceMethod(cls, g, (IMP)generate_samples, types);
+			say("hakios: mediaserverd: -[BWAudioSourceNode _generateSamples] (%s) wrapped: nothing after a stop\n", types);
+		} else {
+			say("hakios: mediaserverd: -[BWAudioSourceNode _generateSamples]: %s; left alone\n", gm ? types : "not there");
+		}
+	}
 }
 
 static void
