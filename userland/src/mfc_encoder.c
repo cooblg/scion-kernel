@@ -791,13 +791,28 @@ patch_image(const struct mach_header *mh, intptr_t slide)
 	int patched = 0;
 
 	(void)slide;
-	if (dladdr(mh, &info) == 0 || info.dli_fname == NULL || strstr(info.dli_fname, "/CMCapture.framework/CMCapture") == NULL) {
+	/*
+	 * CMCapture's alone (step 79: 8 pointers patched, still no session) was not where the recording's compressor calls from;
+	 * MediaToolbox imports VTCompressionSessionCreate and EncodeFrame as well (found by reading every image's stubs in the cache).
+	 */
+	static const char *const callers[] = { "/CMCapture.framework/CMCapture", "/MediaToolbox.framework/MediaToolbox" };
+	const char *who = NULL;
+
+	if (dladdr(mh, &info) == 0 || info.dli_fname == NULL) {
+		return;
+	}
+	for (unsigned c = 0; c < sizeof(callers) / sizeof(callers[0]); c++) {
+		if (strstr(info.dli_fname, callers[c]) != NULL) {
+			who = strrchr(callers[c], '/') + 1;
+		}
+	}
+	if (who == NULL) {
 		return;
 	}
 	const uint8_t *stubs = getsectiondata((const struct mach_header_64 *)mh, "__TEXT", "__stubs", &size);
 
 	if (stubs == NULL) {
-		say("CMCapture: no __stubs");
+		say("%s: no __stubs", who);
 		return;
 	}
 	for (unsigned long k = 0; k + 12 <= size; k += 12) {
@@ -822,7 +837,7 @@ patch_image(const struct mach_header *mh, intptr_t slide)
 			kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
 
 			if (kr != KERN_SUCCESS) {
-				say("CMCapture: %s's pointer at %p not writable (%d)", patches[i].name, (void *)slot, kr);
+				say("%s: %s's pointer at %p not writable (%d)", who, patches[i].name, (void *)slot, kr);
 				break;
 			}
 			*slot = patches[i].replacement;  /* (the page left writable: it may hold data CMCapture writes) */
@@ -830,7 +845,7 @@ patch_image(const struct mach_header *mh, intptr_t slide)
 			break;
 		}
 	}
-	say("CMCapture: %d of its pointers into VideoToolbox's compression now come here", patched);
+	say("%s: %d of its pointers into VideoToolbox's compression now come here", who, patched);
 }
 
 __attribute__((constructor)) static void
