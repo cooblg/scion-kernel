@@ -754,6 +754,17 @@ hakios_media_init(void)
 		CFPreferencesAppSynchronize(CFSTR("com.apple.coremedia"));
 		CFRelease(n);
 		say("hakios: mediaserverd: com.apple.coremedia bwgraph_trace = 1 (the capture graph's trace)\n");
+		/*
+		 * CMCapture reads the category when it is loaded, before this constructor: its flag itself (FigNote's word in
+		 * CMCapture's __DATA, 0x1dd72cb38 in 20F66's cache, before the slide) is set as well.
+		 */
+		volatile int *flag = (volatile int *)(0x1dd72cb38UL + slide);
+		uintptr_t lo = (uintptr_t)_dyld_get_shared_cache_range(&length);
+
+		if ((uintptr_t)flag > lo && (uintptr_t)flag < lo + length) {
+			*flag = 1;
+			say("hakios: mediaserverd: bwgraph_trace's flag set in CMCapture\n");
+		}
 	}
 	metal_left_alone = boot_arg("mediamtl=1");
 	if (metal_left_alone) {
