@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
 #include <unistd.h>
 
 /*
@@ -271,3 +272,72 @@ hakios_tweaks_init(void)
 	done = true;
 	load_the_tweaks();
 }
+
+/*
+ * Settings' storage (General > iPhone Storage) takes the phone's capacity from MobileGestalt's DiskUsage, which counts the
+ * root volume's container: here the system image (about 4 GB), with /private/var a volume of its own (HFS Plus, all of
+ * USERDATA: ~118 GB) that the iPhone's single APFS container would have held. So the answer is given the data volume's
+ * numbers (and the two together as the disk's), when /private/var is that kept volume; otherwise it is left as it is.
+ */
+extern CFTypeRef MGCopyAnswer(CFStringRef key, CFDictionaryRef options);
+
+static void
+set_i64(CFMutableDictionaryRef d, CFStringRef key, long long v)
+{
+	CFNumberRef n = CFNumberCreate(NULL, kCFNumberLongLongType, &v);
+
+	if (n != NULL) {
+		CFDictionarySetValue(d, key, n);
+		CFRelease(n);
+	}
+}
+
+static CFTypeRef
+my_MGCopyAnswer(CFStringRef key, CFDictionaryRef options)
+{
+	CFTypeRef v = MGCopyAnswer(key, options);
+	static int said;
+	struct statfs root, var;
+
+	if (key == NULL || !CFEqual(key, CFSTR("DiskUsage")) || v == NULL || CFGetTypeID(v) != CFDictionaryGetTypeID()) {
+		return v;
+	}
+	if (statfs("/private/var", &var) != 0 || strcmp(var.f_fstypename, "hfs") != 0 || statfs("/", &root) != 0) {
+		return v;
+	}
+	long long data_cap = (long long)var.f_blocks * var.f_bsize, data_free = (long long)var.f_bavail * var.f_bsize;
+	long long sys_cap = (long long)root.f_blocks * root.f_bsize, sys_free = (long long)root.f_bavail * root.f_bsize;
+	CFMutableDictionaryRef d = CFDictionaryCreateMutableCopy(NULL, 0, v);
+
+	if (d == NULL) {
+		return v;
+	}
+	if (!said) {
+		CFStringRef desc = CFCopyDescription(v);
+		char buf[400] = "";
+
+		if (desc != NULL) {
+			CFStringGetCString(desc, buf, sizeof(buf), kCFStringEncodingUTF8);
+			CFRelease(desc);
+		}
+		say("hakios: tweaks: DiskUsage was %s\n", buf);
+	}
+	set_i64(d, CFSTR("TotalDataCapacity"), data_cap);
+	set_i64(d, CFSTR("TotalDataAvailable"), data_free);
+	set_i64(d, CFSTR("AmountDataAvailable"), data_free);
+	set_i64(d, CFSTR("TotalSystemCapacity"), sys_cap);
+	set_i64(d, CFSTR("TotalSystemAvailable"), sys_free);
+	set_i64(d, CFSTR("TotalDiskCapacity"), data_cap + sys_cap);
+	if (!said) {
+		said = 1;
+		say("hakios: tweaks: DiskUsage given the kept volume: data %lld of %lld, system %lld, disk %lld bytes\n", data_free,
+		    data_cap, sys_cap, data_cap + sys_cap);
+	}
+	CFRelease(v);
+	return d;
+}
+
+__attribute__((used)) static const struct { const void *replacement, *replacee; } hakios_mg_interposers[]
+    __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *)my_MGCopyAnswer, (const void *)MGCopyAnswer },
+};
