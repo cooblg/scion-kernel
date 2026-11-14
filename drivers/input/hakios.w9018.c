@@ -155,6 +155,10 @@ pen_thread(void *param, __unused wait_result_t wr)
 		const uint8_t *qq = q + QUERY_POS;
 		uint32_t qx = (uint32_t)qq[1] << 8 | qq[2], qy = (uint32_t)qq[3] << 8 | qq[4];
 
+		say("w9018: 1: the query raw: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x | %02x %02x %02x "
+		    "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9],
+		    q[10], q[11], q[12], q[13], q[14], q[15], q[16], q[17], q[18], q[19], q[20], q[21], q[22], q[23], q[24], q[25], q[26],
+		    q[27], q[28]);
 		say("w9018: 1: the query: header %02x, max x %u, max y %u, max pressure %u, firmware %04x\n", qq[0], qx, qy,
 		    (uint32_t)qq[5] << 8 | qq[6], (uint32_t)qq[7] << 8 | qq[8]);
 		if (qq[0] == 0x0F && qx > 1000 && qy > 1000) {
@@ -185,10 +189,11 @@ pen_thread(void *param, __unused wait_result_t wr)
 		uint32_t wx = (uint32_t)p[1] << 8 | p[2], wy = (uint32_t)p[3] << 8 | p[4];
 		uint32_t pressure = (uint32_t)p[5] << 8 | p[6];
 
-		if (said < 20 || (packets % 2000) == 0) {
+		if (said < 300 || (packets % 2000) == 0) {
+			/* the raw bytes (the layout above is Samsung's driver's, and this firmware's numbers did not fit it) */
 			said++;
-			say("w9018: packet %llu: %02x x %u y %u pressure %u tilt %d,%d [12] %02x\n", (unsigned long long)packets, p[0], wx, wy,
-			    pressure, (int8_t)p[9], (int8_t)p[8], p[12]);
+			say("w9018: raw %llu: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			    (unsigned long long)packets, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13]);
 		}
 		if (steps < 3 || !ready || (p[12] & 0x80)) {
 			continue;

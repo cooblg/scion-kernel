@@ -402,6 +402,30 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 		}
 		return;
 	}
+	if (ended_outputs != NULL) {
+		bool drop = false;
+
+		pthread_mutex_lock(&ended_lock);
+		if (CFSetContainsValue(ended_outputs, (const void *)self)) {
+			Ivar lf = class_getInstanceVariable(object_getClass(self), "_liveFormat");
+
+			if (lf != NULL && object_getIvar(self, lf) == nil) {
+				drop = true;            /* the audio source, still running after its stop: not after its end */
+			} else {
+				CFSetRemoveValue(ended_outputs, (const void *)self);   /* live again: a new session */
+			}
+		}
+		pthread_mutex_unlock(&ended_lock);
+		if (drop) {
+			static bool said_drop;
+
+			if (!said_drop) {
+				said_drop = true;
+				say("hakios: mediaserverd: a buffer for an output already ended (the audio source after its stop): dropped\n");
+			}
+			return;
+		}
+	}
 	time_photo_encoder(self, sample_buffer);
 	((void (*)(id, SEL, CMSampleBufferRef))original_emit_sample_buffer)(self, selector, sample_buffer);
 }
@@ -754,6 +778,8 @@ wait_for_mfc(void *unused)
  * marked ended. A node that ended its outputs itself is left as it is.
  */
 static IMP original_audio_source_stop;
+static CFMutableSetRef ended_outputs;           /* outputs we marked ended: their later buffers are dropped */
+static pthread_mutex_t ended_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void
 audio_source_end(void *context)
@@ -766,6 +792,12 @@ audio_source_end(void *context)
 		id out = ((id (*)(id, SEL, long))objc_msgSend)(outputs, sel_registerName("objectAtIndex:"), i);
 
 		if (send0(out, "liveFormat") != nil) {
+			pthread_mutex_lock(&ended_lock);
+			if (ended_outputs == NULL) {
+				ended_outputs = CFSetCreateMutable(NULL, 0, NULL);
+			}
+			CFSetAddValue(ended_outputs, (const void *)out);
+			pthread_mutex_unlock(&ended_lock);
 			((void (*)(id, SEL))objc_msgSend)(out, sel_registerName("markEndOfLiveOutput"));
 			ended++;
 		}
