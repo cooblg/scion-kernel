@@ -75,6 +75,8 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 #define CACHE_BASE 0x180000000UL                /* where the cache was built to be, before the slide */
 
 static uintptr_t slide;
+static CFMutableSetRef ended_outputs;           /* outputs we marked ended: their later buffers are dropped */
+static pthread_mutex_t ended_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* +[BWCoreImageFilterRenderer prewarmPortraitFilterVersion:semanticStyleFilters:] */
 static void
@@ -778,8 +780,6 @@ wait_for_mfc(void *unused)
  * marked ended. A node that ended its outputs itself is left as it is.
  */
 static IMP original_audio_source_stop;
-static CFMutableSetRef ended_outputs;           /* outputs we marked ended: their later buffers are dropped */
-static pthread_mutex_t ended_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void
 audio_source_end(void *context)
