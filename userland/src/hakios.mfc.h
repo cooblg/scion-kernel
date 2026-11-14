@@ -49,7 +49,7 @@ struct hakios_mfc_decode {
 #define HAKIOS_MFC_DECODE       _IOWR('M', 2, struct hakios_mfc_decode)
 
 /*
- * /dev/hakios-mfcenc: the same block's H.264 encoder (one client at a time, beside the decoder's). HAKIOS_MFC_ENC_OPEN with the size,
+ * /dev/hakios-mfcenc: the same block's H.264 and HEVC encoder (one client at a time, beside the decoder's). HAKIOS_MFC_ENC_OPEN with the size,
  * the rate and the bitrate gives back the parameter sets (SPS and PPS, Annex B); then HAKIOS_MFC_ENC_FRAME with each picture's NV12 planes
  * gives back its access unit (Annex B), in the same order: no B frames, one picture in, one out. Close ends the instance.
  */
@@ -63,7 +63,7 @@ struct hakios_mfc_enc_open {
 	uint32_t header_room;           /* in: bytes at header */
 	uint64_t header;                /* in: where the parameter sets go */
 	uint32_t header_bytes;          /* out */
-	uint32_t reserved;
+	uint32_t codec;                 /* in: HAKIOS_MFC_H264 or HAKIOS_MFC_HEVC (profile then: 0 Main) */
 };
 
 struct hakios_mfc_enc_frame {

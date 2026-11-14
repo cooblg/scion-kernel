@@ -1039,7 +1039,16 @@ self_test(void)
  * No B frames and parallel processing off (E_ENC_OPTIONS bit 18): each picture's access unit comes back for it, in order.
  */
 #define E_CODEC_H264            20
-#define E_CTX                   0x19000u        /* 100 KB, page-rounded */
+#define E_CODEC_HEVC            26
+#define E_CTX                   0x19000u        /* H.264's 100 KB, page-rounded (HEVC's 40 KB fits in it) */
+#define E_HEVC_OPTIONS_2        0xFDC4
+#define E_HEVC_OPTIONS          0xFDD4
+#define E_HEVC_REFRESH_PERIOD   0xFDD8
+#define E_HEVC_CHROMA_QP_OFFSET 0xFDDC
+#define E_HEVC_LF_BETA          0xFDE0
+#define E_HEVC_LF_TC            0xFDE4
+#define E_SAO_WEIGHT0           0xF7C8
+#define E_SAO_WEIGHT1           0xF7CC
 #define E_STREAM                (4u << 20)
 #define E_FRAME_WIDTH           0xF770
 #define E_FRAME_HEIGHT          0xF774
@@ -1113,7 +1122,7 @@ self_test(void)
 #define E_HIER_BIT_LAYER0       0xFD18
 
 static struct {
-	int open, buffers;
+	int open, buffers, hevc;
 	uint32_t inst, width, height, stride, rows, dpb, scratch, luma, chroma, me;
 	uint64_t base_pa, codec_pa;             /* carved: context + stream + source; the codec's buffers */
 	uint32_t base_bytes, codec_bytes;
@@ -1205,6 +1214,30 @@ enc_params(const struct hakios_mfc_enc_open *o)
 	W(E_GOP_CONFIG, (gop & 0xFFFFu) | (1u << 19));
 	W(E_GOP_CONFIG2, (gop >> 16) & 0x3FFFu);
 
+	if (E.hevc) {
+		/*
+		 * HEVC Main, tier 0. Its options: the BSP's default word (0x8050F215: partition depth 1, refresh type 2, loop filter across
+		 * slices, merge candidates ...) with one reference instead of two (bit 2: "the performance falls by half") and the parameter
+		 * sets not repeated (bit 26); no 32x32 transform (bit 30), no long-term references, no temporal layers.
+		 */
+		W(E_PICTURE_PROFILE, (level << 8) | 0u);
+		W(E_HEVC_OPTIONS, 0x8050F215u & ~(1u << 2) & ~(1u << 26) & ~(1u << 30) & ~(1u << 10));
+		W(E_HEVC_OPTIONS_2, 0);
+		W(E_HEVC_REFRESH_PERIOD, 0);
+		W(E_HEVC_CHROMA_QP_OFFSET, 0);
+		W(E_HEVC_LF_BETA, 0);
+		W(E_HEVC_LF_TC, 0);
+		W(E_SAO_WEIGHT0, 0);
+		W(E_SAO_WEIGHT1, 0);
+		W(E_NUM_T_LAYER, 0x7u << 4);
+		for (uint32_t i = 0; i < 7; i++) {
+			W(E_HIER_QP_LAYER0 + 4 * i, 0);
+			W(E_HIER_BIT_LAYER0 + 4 * i, 0);
+		}
+		W(E_RC_ROI_CTRL, 0x3FD00u & ~1u);
+		W(E_VIDEO_SIGNAL_TYPE, 0);
+		return;
+	}
 	W(E_PICTURE_PROFILE, (level << 8) | profile);
 	/* CABAC for Main and High, the loop filter on, one reference, 8x8 transform for High, constraint_set0, SPS/PPS not repeated, no VUI */
 	h264 = (profile != HAKIOS_MFC_ENC_BASELINE ? 1u : 0u) | (profile == HAKIOS_MFC_ENC_HIGH ? (3u << 12) : 0u) | (1u << 26);
@@ -1236,6 +1269,7 @@ enc_open(struct hakios_mfc_enc_open *o)
 	if (o->width < 64 || o->height < 64 || o->width > 4096 || o->height > 4096 || (o->width & 1) || (o->height & 1)) {
 		return EINVAL;
 	}
+	E.hevc = o->codec == HAKIOS_MFC_HEVC;
 	E.width = o->width;
 	E.height = o->height;
 	E.stride = ROUND_UP(E.width, 16);
@@ -1255,7 +1289,7 @@ enc_open(struct hakios_mfc_enc_open *o)
 	bzero(E.ctx, E_CTX);
 	bzero(E.src_y, y_bytes + uv_bytes);     /* (the rows below the picture, which the block reads, black-ish rather than stale) */
 
-	W(CODEC_TYPE, E_CODEC_H264);
+	W(CODEC_TYPE, E.hevc ? E_CODEC_HEVC : E_CODEC_H264);
 	W(CONTEXT_MEM_ADDR, PA(E.ctx));
 	W(CONTEXT_MEM_SIZE, E_CTX);
 	if ((error = expect(H2R_OPEN_INSTANCE, R2H_OPEN_INSTANCE, "encoder OPEN_INSTANCE")) != 0) {
@@ -1291,7 +1325,13 @@ enc_open(struct hakios_mfc_enc_open *o)
 	mbh = (E.height + 15) / 16;
 	E.luma = ROUND_UP(((E.width + 63) / 64) * 64 * ((E.height + 31) / 32) * 32 + 64, 64);
 	E.chroma = ROUND_UP(((E.width + 63) / 64) * 64 * ((((E.height + 31) / 32) * 32) / 2) + 64, 64);
-	E.me = ROUND_UP(((mbw + 3) * (mbh + 3) * 8) + ((((mbw * mbh) + 63) / 64) * 32) + (((mbh * 64) + 2304) * (mbw + 7) / 8), 256);
+	if (E.hevc) {
+		uint32_t lw = (E.width + 31) / 32, lh = (E.height + 31) / 32;      /* the encoder's 32x32 coding units */
+
+		E.me = ROUND_UP(((lw + 3) * (lh + 3) * 32) + (((lh * 128) + 2304) * (lw + 3) / 4), 256);
+	} else {
+		E.me = ROUND_UP(((mbw + 3) * (mbh + 3) * 8) + ((((mbw * mbh) + 63) / 64) * 32) + (((mbh * 64) + 2304) * (mbw + 7) / 8), 256);
+	}
 	E.codec_bytes = E.scratch + E.dpb * (E.luma + E.chroma + E.me);
 	if (carve_any(E.codec_bytes, &pa) != 0) {
 		say("exynos_mfc: encoder: no room for the codec's %u bytes\n", E.codec_bytes);
@@ -1321,8 +1361,8 @@ enc_open(struct hakios_mfc_enc_open *o)
 		return error;
 	}
 	E.buffers = 1;
-	say("exynos_mfc: encoder: %ux%u H.264 (profile %u, level %u), %u fps, %u b/s, key every %u; header %u bytes, %u references, scratch %u, "
-	    "%u + %u bytes carved\n", E.width, E.height, o->profile, o->level ? o->level : 40, o->fps ? o->fps : 30, o->bitrate ? o->bitrate : 10000000,
+	say("exynos_mfc: encoder: %ux%u %s (profile %u, level %u), %u fps, %u b/s, key every %u; header %u bytes, %u references, scratch %u, "
+	    "%u + %u bytes carved\n", E.width, E.height, E.hevc ? "HEVC" : "H.264", o->profile, o->level ? o->level : 40, o->fps ? o->fps : 30, o->bitrate ? o->bitrate : 10000000,
 	    o->gop ? o->gop : (o->fps ? o->fps : 30), n, E.dpb, E.scratch, E.base_bytes, E.codec_bytes);
 	return 0;
 }

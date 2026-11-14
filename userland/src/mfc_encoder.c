@@ -1,5 +1,5 @@
 /*
- * H.264 encoding for mediaserverd on the Exynos 9810's MFC (kernel: bsd/dev/hakios.exynos_mfc.c, /dev/hakios-mfcenc), part of
+ * H.264 and HEVC encoding for mediaserverd on the Exynos 9810's MFC (kernel: bsd/dev/hakios.exynos_mfc.c, /dev/hakios-mfcenc), part of
  * libhakios.media.dylib.
  *
  * Why: this iPhone's VideoToolbox has no H.264 encoder and only a software HEVC one (VCPHEVC.videocodec, registered for the
@@ -9,10 +9,12 @@
  * How: VideoToolbox's public compression API is interposed in this process. A session asked for H.264 ('avc1') is made as an HEVC
  * session underneath -- an object VideoToolbox knows, for the calls this file passes on (its pixel buffer pool, its properties) --
  * and every picture given to it is encoded by the block instead, synchronously: VTCompressionSessionEncodeFrame returns once the
- * picture's sample buffer has gone to the session's output callback. Everything else ('hvc1' for the photographs, any session
- * when /dev/hakios-mfcenc is missing or busy) is VideoToolbox's own, untouched.
+ * picture's sample buffer has gone to the session's output callback. An HEVC ('hvc1') session is VideoToolbox's own, made as asked;
+ * at its first picture it is taken for the block only if it is a video's -- real time asked for, a frame rate given, or a video's
+ * size -- so the photographs' HEIC (CMPhoto) stays with VideoToolbox's encoder. Any session when /dev/hakios-mfcenc is missing or
+ * busy is VideoToolbox's own, untouched.
  *
- * The block gives Annex B; the sample buffers carry AVCC (4-byte lengths) and a format made from its SPS and PPS.
+ * The block gives Annex B; the sample buffers carry length-prefixed NAL units (4 bytes) and a format made from its parameter sets.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
@@ -42,6 +44,11 @@ struct enc_session {
 	void *refcon;
 	int32_t width, height;
 	uint32_t fps, bitrate, gop, profile;
+	bool hevc;                              /* the codec asked for */
+	bool dummy;                             /* H.264: the session underneath is a stand-in; its properties are not passed on */
+	bool mine;                              /* its pictures go to the block */
+	bool decided;                           /* HEVC: whether they do, settled at the first picture */
+	bool realtime, fps_given;
 	bool opened, failed;
 	CMVideoFormatDescriptionRef format;
 	uint8_t *stream;
@@ -121,55 +128,117 @@ open_device(void)
 	return fd;
 }
 
-/* ---- the interposed functions ---------------------------------------------------------------------------------------------- */
+/* a slot for a new session (under the lock): a stale one of the same address dropped; when all are taken, the oldest given up */
+static unsigned next_victim;
 
-static OSStatus
-hk_VTCompressionSessionCreate(CFAllocatorRef allocator, int32_t width, int32_t height, CMVideoCodecType codec, CFDictionaryRef specification,
-    CFDictionaryRef source_attributes, CFAllocatorRef compressed_allocator, VTCompressionOutputCallback callback, void *refcon,
-    VTCompressionSessionRef *out)
+static struct enc_session *
+slot_for(VTCompressionSessionRef session)
 {
-	OSStatus status;
-	int fd;
-
-	if (said_creates++ < 12) {
-		say("a session asked for: '%c%c%c%c' %dx%d, %s callback", (char)(codec >> 24), (char)(codec >> 16), (char)(codec >> 8), (char)codec,
-		    width, height, callback != NULL ? "a" : "no");
-	}
-	if (codec != kCMVideoCodecType_H264 || out == NULL) {
-		return VTCompressionSessionCreate(allocator, width, height, codec, specification, source_attributes, compressed_allocator, callback,
-		    refcon, out);
-	}
-	pthread_mutex_lock(&lock);
-	fd = open_device();
-	if (fd < 0) {
-		pthread_mutex_unlock(&lock);
-		say("H.264 %dx%d: no /dev/hakios-mfcenc (%d): VideoToolbox's own", width, height, errno);
-		return VTCompressionSessionCreate(allocator, width, height, codec, specification, source_attributes, compressed_allocator, callback,
-		    refcon, out);
-	}
-	/* the session underneath: HEVC, which VideoToolbox here can make; it is never given a picture */
-	status = VTCompressionSessionCreate(allocator, width, height, kCMVideoCodecType_HEVC, NULL, source_attributes, compressed_allocator, NULL,
-	    NULL, out);
-	if (status != noErr || *out == NULL) {
-		close(fd);
-		pthread_mutex_unlock(&lock);
-		say("H.264 %dx%d: the session underneath was refused (%d)", width, height, (int)status);
-		return status != noErr ? status : kVTVideoEncoderNotAvailableNowErr;
-	}
 	struct enc_session *e = NULL;
 
+	for (int i = 0; i < SESSIONS_MAX; i++) {
+		if (sessions[i].session == session) {
+			release(&sessions[i]);  /* (an object freed without an invalidate, its address used again) */
+		}
+	}
 	for (int i = 0; i < SESSIONS_MAX && e == NULL; i++) {
 		if (sessions[i].session == NULL) {
 			e = &sessions[i];
 		}
 	}
 	if (e == NULL) {
-		release(&sessions[0]);          /* (the oldest slot: one never invalidated) */
-		e = &sessions[0];
+		e = &sessions[next_victim++ % SESSIONS_MAX];
+		release(e);
 	}
 	memset(e, 0, sizeof(*e));
-	e->session = *out;
+	e->fd = -1;
+	e->session = session;
+	return e;
+}
+
+/* ---- the interposed functions ---------------------------------------------------------------------------------------------- */
+
+/*
+ * VideoToolbox's private create, which its public one calls inside the library (so interposing the public one alone catches nobody
+ * inside the shared cache: 15 November, CMCapture's compressor never came through it). Read from its code in 20F66: the public
+ * VTCompressionSessionCreate passes its ten arguments on with a NULL inserted before the last -- options, a dictionary.
+ */
+extern OSStatus VTCompressionSessionCreateWithOptions(CFAllocatorRef allocator, int32_t width, int32_t height, CMVideoCodecType codec,
+    CFDictionaryRef specification, CFDictionaryRef source_attributes, CFAllocatorRef compressed_allocator, VTCompressionOutputCallback callback,
+    void *refcon, CFDictionaryRef options, VTCompressionSessionRef *out);
+extern OSStatus VTCompressionSessionSetProperty(VTCompressionSessionRef session, CFStringRef key, CFTypeRef value);
+extern OSStatus VTCompressionSessionSetProperties(VTCompressionSessionRef session, CFDictionaryRef properties);
+extern OSStatus VTCompressionSessionCopyProperty(VTCompressionSessionRef session, CFStringRef key, CFAllocatorRef allocator, void *value);
+
+static OSStatus
+real_create(bool with_options, CFAllocatorRef allocator, int32_t width, int32_t height, CMVideoCodecType codec, CFDictionaryRef specification,
+    CFDictionaryRef source_attributes, CFAllocatorRef compressed_allocator, VTCompressionOutputCallback callback, void *refcon,
+    CFDictionaryRef options, VTCompressionSessionRef *out)
+{
+	if (with_options) {
+		return VTCompressionSessionCreateWithOptions(allocator, width, height, codec, specification, source_attributes, compressed_allocator,
+		    callback, refcon, options, out);
+	}
+	return VTCompressionSessionCreate(allocator, width, height, codec, specification, source_attributes, compressed_allocator, callback,
+	    refcon, out);
+}
+
+static OSStatus
+create(bool with_options, CFAllocatorRef allocator, int32_t width, int32_t height, CMVideoCodecType codec, CFDictionaryRef specification,
+    CFDictionaryRef source_attributes, CFAllocatorRef compressed_allocator, VTCompressionOutputCallback callback, void *refcon,
+    CFDictionaryRef options, VTCompressionSessionRef *out)
+{
+	OSStatus status;
+	int fd;
+
+	if (said_creates++ < 16) {
+		say("a session asked for%s: '%c%c%c%c' %dx%d, %s callback", with_options ? " (with options)" : "", (char)(codec >> 24),
+		    (char)(codec >> 16), (char)(codec >> 8), (char)codec, width, height, callback != NULL ? "a" : "no");
+	}
+	if (codec == kCMVideoCodecType_HEVC && out != NULL) {
+		status = real_create(with_options, allocator, width, height, codec, specification, source_attributes, compressed_allocator, callback,
+		    refcon, options, out);
+		if (status == noErr && *out != NULL) {
+			pthread_mutex_lock(&lock);
+			struct enc_session *e = slot_for(*out);
+
+			e->callback = callback;
+			e->refcon = refcon;
+			e->width = width;
+			e->height = height;
+			e->fps = 30;
+			e->hevc = true;
+			pthread_mutex_unlock(&lock);
+		}
+		return status;
+	}
+	if (codec != kCMVideoCodecType_H264 || out == NULL) {
+		return real_create(with_options, allocator, width, height, codec, specification, source_attributes, compressed_allocator, callback,
+		    refcon, options, out);
+	}
+	pthread_mutex_lock(&lock);
+	fd = open_device();
+	if (fd < 0) {
+		pthread_mutex_unlock(&lock);
+		say("H.264 %dx%d: no /dev/hakios-mfcenc (%d): VideoToolbox's own", width, height, errno);
+		return real_create(with_options, allocator, width, height, codec, specification, source_attributes, compressed_allocator, callback,
+		    refcon, options, out);
+	}
+	/* the session underneath: HEVC, which VideoToolbox here can make; it is never given a picture */
+	status = real_create(with_options, allocator, width, height, kCMVideoCodecType_HEVC, NULL, source_attributes, compressed_allocator, NULL,
+	    NULL, NULL, out);
+	if (status != noErr || *out == NULL) {
+		close(fd);
+		pthread_mutex_unlock(&lock);
+		say("H.264 %dx%d: the session underneath was refused (%d)", width, height, (int)status);
+		return status != noErr ? status : kVTVideoEncoderNotAvailableNowErr;
+	}
+	struct enc_session *e = slot_for(*out);
+
 	e->fd = fd;
+	e->dummy = true;
+	e->mine = true;
+	e->decided = true;
 	e->callback = callback;
 	e->refcon = refcon;
 	e->width = width;
@@ -180,6 +249,25 @@ hk_VTCompressionSessionCreate(CFAllocatorRef allocator, int32_t width, int32_t h
 	say("H.264 %dx%d: session %p on the MFC", width, height, (void *)*out);
 	return noErr;
 }
+
+static OSStatus
+hk_VTCompressionSessionCreate(CFAllocatorRef allocator, int32_t width, int32_t height, CMVideoCodecType codec, CFDictionaryRef specification,
+    CFDictionaryRef source_attributes, CFAllocatorRef compressed_allocator, VTCompressionOutputCallback callback, void *refcon,
+    VTCompressionSessionRef *out)
+{
+	return create(false, allocator, width, height, codec, specification, source_attributes, compressed_allocator, callback, refcon, NULL, out);
+}
+
+static OSStatus
+hk_VTCompressionSessionCreateWithOptions(CFAllocatorRef allocator, int32_t width, int32_t height, CMVideoCodecType codec,
+    CFDictionaryRef specification, CFDictionaryRef source_attributes, CFAllocatorRef compressed_allocator, VTCompressionOutputCallback callback,
+    void *refcon, CFDictionaryRef options, VTCompressionSessionRef *out)
+{
+	return create(true, allocator, width, height, codec, specification, source_attributes, compressed_allocator, callback, refcon, options, out);
+}
+
+/* the first call of each function that passes through: which ones mediaserverd's code really calls */
+#define FIRST(name) do { static int said_; if (!said_++) say("first call of %s (not ours)", name); } while (0)
 
 static uint32_t
 number(CFTypeRef value)
@@ -200,6 +288,9 @@ take_property(struct enc_session *e, CFStringRef key, CFTypeRef value)
 		e->bitrate = number(value);
 	} else if (CFEqual(key, kVTCompressionPropertyKey_ExpectedFrameRate)) {
 		e->fps = number(value) ? number(value) : e->fps;
+		e->fps_given = number(value) != 0;
+	} else if (CFEqual(key, kVTCompressionPropertyKey_RealTime)) {
+		e->realtime = value == kCFBooleanTrue;
 	} else if (CFEqual(key, kVTCompressionPropertyKey_MaxKeyFrameInterval)) {
 		e->gop = number(value);
 	} else if (CFEqual(key, kVTCompressionPropertyKey_ProfileLevel) && value != NULL && CFGetTypeID(value) == CFStringGetTypeID()) {
@@ -221,11 +312,10 @@ hk_VTSessionSetProperty(VTSessionRef session, CFStringRef key, CFTypeRef value)
 	if (e != NULL && key != NULL) {
 		take_property(e, key, value);
 	}
+	bool swallow = e != NULL && e->dummy;
+
 	pthread_mutex_unlock(&lock);
-	if (e != NULL) {
-		return noErr;
-	}
-	return VTSessionSetProperty(session, key, value);
+	return swallow ? noErr : VTSessionSetProperty(session, key, value);
 }
 
 static void
@@ -246,17 +336,18 @@ hk_VTSessionSetProperties(VTSessionRef session, CFDictionaryRef properties)
 	if (e != NULL && properties != NULL) {
 		CFDictionaryApplyFunction(properties, take_one, e);
 	}
+	bool swallow = e != NULL && e->dummy;
+
 	pthread_mutex_unlock(&lock);
-	if (e != NULL) {
-		return noErr;
-	}
-	return VTSessionSetProperties(session, properties);
+	return swallow ? noErr : VTSessionSetProperties(session, properties);
 }
 
 static OSStatus
 hk_VTSessionCopyProperty(VTSessionRef session, CFStringRef key, CFAllocatorRef allocator, void *value)
 {
-	if (find(session) != NULL && key != NULL && value != NULL) {
+	struct enc_session *e = find(session);
+
+	if (e != NULL && e->mine && key != NULL && value != NULL) {
 		if (CFEqual(key, CFSTR("UsingHardwareAcceleratedVideoEncoder"))) {
 			*(CFTypeRef *)value = CFRetain(kCFBooleanTrue);
 			return noErr;
@@ -272,9 +363,54 @@ hk_VTSessionCopyProperty(VTSessionRef session, CFStringRef key, CFAllocatorRef a
 }
 
 static OSStatus
+hk_VTCompressionSessionSetProperty(VTCompressionSessionRef session, CFStringRef key, CFTypeRef value)
+{
+	struct enc_session *e;
+
+	pthread_mutex_lock(&lock);
+	e = find(session);
+	if (e != NULL && key != NULL) {
+		take_property(e, key, value);
+	}
+	bool swallow = e != NULL && e->dummy;
+
+	pthread_mutex_unlock(&lock);
+	return swallow ? noErr : VTCompressionSessionSetProperty(session, key, value);
+}
+
+static OSStatus
+hk_VTCompressionSessionSetProperties(VTCompressionSessionRef session, CFDictionaryRef properties)
+{
+	struct enc_session *e;
+
+	pthread_mutex_lock(&lock);
+	e = find(session);
+	if (e != NULL && properties != NULL) {
+		CFDictionaryApplyFunction(properties, take_one, e);
+	}
+	bool swallow = e != NULL && e->dummy;
+
+	pthread_mutex_unlock(&lock);
+	return swallow ? noErr : VTCompressionSessionSetProperties(session, properties);
+}
+
+static OSStatus
+hk_VTCompressionSessionCopyProperty(VTCompressionSessionRef session, CFStringRef key, CFAllocatorRef allocator, void *value)
+{
+	struct enc_session *e = find(session);
+
+	if (e != NULL && e->mine) {
+		return hk_VTSessionCopyProperty(session, key, allocator, value);
+	}
+	return VTCompressionSessionCopyProperty(session, key, allocator, value);
+}
+
+static OSStatus
 hk_VTCompressionSessionPrepareToEncodeFrames(VTCompressionSessionRef session)
 {
-	if (find(session) != NULL) {
+	struct enc_session *e = find(session);
+
+	if (e != NULL && e->dummy) {
 		return noErr;
 	}
 	return VTCompressionSessionPrepareToEncodeFrames(session);
@@ -283,7 +419,9 @@ hk_VTCompressionSessionPrepareToEncodeFrames(VTCompressionSessionRef session)
 static OSStatus
 hk_VTCompressionSessionCompleteFrames(VTCompressionSessionRef session, CMTime until)
 {
-	if (find(session) != NULL) {
+	struct enc_session *e = find(session);
+
+	if (e != NULL && e->mine) {
 		return noErr;                   /* (every picture was finished in its own encode call) */
 	}
 	return VTCompressionSessionCompleteFrames(session, until);
@@ -302,12 +440,26 @@ hk_VTCompressionSessionInvalidate(VTCompressionSessionRef session)
 	VTCompressionSessionInvalidate(session);
 }
 
-/* the block's parameter sets: Annex B, SPS (type 7) then PPS (type 8) */
-static CMVideoFormatDescriptionRef
-format_from(const uint8_t *h, size_t n, int32_t width, int32_t height)
+/* a NAL unit's type: H.264's 5 bits; HEVC's 6, after the forbidden bit */
+static uint8_t
+nal_type(bool hevc, uint8_t first)
 {
-	const uint8_t *sets[2] = { NULL, NULL };
-	size_t sizes[2] = { 0, 0 }, i = 0;
+	return hevc ? (first >> 1) & 0x3F : first & 0x1F;
+}
+
+/* parameter sets: H.264's SPS 7, PPS 8, AUD 9; HEVC's VPS 32, SPS 33, PPS 34, AUD 35 */
+static bool
+is_parameter_set(bool hevc, uint8_t type)
+{
+	return hevc ? (type >= 32 && type <= 35) : (type >= 7 && type <= 9);
+}
+
+/* the block's parameter sets, Annex B: H.264's SPS and PPS, or HEVC's VPS, SPS and PPS */
+static CMVideoFormatDescriptionRef
+format_from(bool hevc, const uint8_t *h, size_t n)
+{
+	const uint8_t *sets[3] = { NULL, NULL, NULL };
+	size_t sizes[3] = { 0, 0, 0 }, i = 0;
 
 	while (i + 3 < n) {
 		if (h[i] == 0 && h[i + 1] == 0 && h[i + 2] == 1) {
@@ -319,36 +471,35 @@ format_from(const uint8_t *h, size_t n, int32_t width, int32_t height)
 			if (end + 2 >= n) {
 				end = n;
 			}
-			uint8_t type = h[start] & 0x1F;
+			uint8_t type = nal_type(hevc, h[start]);
+			int k = hevc ? (type == 32 ? 0 : type == 33 ? 1 : type == 34 ? 2 : -1) : (type == 7 ? 0 : type == 8 ? 1 : -1);
 
-			if (type == 7 && sets[0] == NULL) {
-				sets[0] = h + start, sizes[0] = end - start;
-			} else if (type == 8 && sets[1] == NULL) {
-				sets[1] = h + start, sizes[1] = end - start;
+			if (k >= 0 && sets[k] == NULL) {
+				sets[k] = h + start, sizes[k] = end - start;
 			}
 			i = end;
 		} else {
 			i++;
 		}
 	}
-	if (sets[0] == NULL || sets[1] == NULL) {
-		say("the header has no SPS or PPS (%zu bytes)", n);
+	if (sets[0] == NULL || sets[1] == NULL || (hevc && sets[2] == NULL)) {
+		say("the %s header lacks a parameter set (%zu bytes)", hevc ? "HEVC" : "H.264", n);
 		return NULL;
 	}
 	CMVideoFormatDescriptionRef format = NULL;
-	OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, sets, sizes, 4, &format);
+	OSStatus status = hevc ? CMVideoFormatDescriptionCreateFromHEVCParameterSets(NULL, 3, sets, sizes, 4, NULL, &format) :
+	    CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, sets, sizes, 4, &format);
 
 	if (status != noErr) {
-		say("the format from the SPS (%zu) and PPS (%zu): %d", sizes[0], sizes[1], (int)status);
+		say("the %s format from parameter sets of %zu, %zu, %zu bytes: %d", hevc ? "HEVC" : "H.264", sizes[0], sizes[1], sizes[2], (int)status);
 		return NULL;
 	}
-	(void)width, (void)height;
 	return format;
 }
 
 /* Annex B to AVCC, in place into `out`; parameter sets dropped (they are in the format). Answers the bytes written. */
 static size_t
-to_avcc(const uint8_t *in, size_t n, uint8_t *out)
+to_avcc(bool hevc, const uint8_t *in, size_t n, uint8_t *out)
 {
 	size_t i = 0, at = 0;
 
@@ -373,9 +524,7 @@ to_avcc(const uint8_t *in, size_t n, uint8_t *out)
 			end = n;
 		}
 		size_t len = end - start;
-		uint8_t type = len > 0 ? in[start] & 0x1F : 0;
-
-		if (len > 0 && type != 7 && type != 8 && type != 9) {
+		if (len > 0 && !is_parameter_set(hevc, nal_type(hevc, in[start]))) {
 			out[at] = (uint8_t)(len >> 24);
 			out[at + 1] = (uint8_t)(len >> 16);
 			out[at + 2] = (uint8_t)(len >> 8);
@@ -394,21 +543,23 @@ open_encoder(struct enc_session *e)
 	uint8_t header[HEADER_ROOM];
 	struct hakios_mfc_enc_open o = {
 		.width = (uint32_t)e->width & ~1u, .height = (uint32_t)e->height & ~1u, .fps = e->fps, .bitrate = e->bitrate,
-		.gop = e->gop, .profile = e->profile, .level = (e->width * e->height > 1280 * 720) ? 40 : 31,
+		.gop = e->gop, .profile = e->hevc ? 0 : e->profile,
+		.level = e->hevc ? ((e->width * e->height > 1280 * 720) ? 41 : 31) : ((e->width * e->height > 1280 * 720) ? 40 : 31),
 		.header_room = sizeof(header), .header = (uint64_t)(uintptr_t)header,
+		.codec = e->hevc ? HAKIOS_MFC_HEVC : HAKIOS_MFC_H264,
 	};
 
 	if (ioctl(e->fd, HAKIOS_MFC_ENC_OPEN, &o) != 0) {
 		say("session %p: the encoder refused %ux%u (%d)", (void *)e->session, o.width, o.height, errno);
 		return false;
 	}
-	e->format = format_from(header, o.header_bytes, e->width, e->height);
+	e->format = format_from(e->hevc, header, o.header_bytes);
 	e->stream = malloc(STREAM_ROOM);
 	if (e->format == NULL || e->stream == NULL) {
 		return false;
 	}
-	say("session %p: %ux%u, %u fps, %u b/s, key every %u, profile %u: header %u bytes", (void *)e->session, o.width, o.height, o.fps,
-	    o.bitrate, o.gop, o.profile, o.header_bytes);
+	say("session %p: %s %ux%u, %u fps, %u b/s, key every %u, profile %u: header %u bytes", (void *)e->session, e->hevc ? "HEVC" : "H.264",
+	    o.width, o.height, o.fps, o.bitrate, o.gop, o.profile, o.header_bytes);
 	return true;
 }
 
@@ -464,7 +615,7 @@ encode(struct enc_session *e, CVImageBufferRef image, CMTime pts, CMTime duratio
 		}
 		return NULL;
 	}
-	size_t n = to_avcc(e->stream, f.bytes, e->stream);
+	size_t n = to_avcc(e->hevc, e->stream, f.bytes, e->stream);
 	if (n == 0) {
 		*status = noErr;                /* (a picture the block skipped: nothing to emit) */
 		return NULL;
@@ -508,6 +659,32 @@ encode(struct enc_session *e, CVImageBufferRef image, CMTime pts, CMTime duratio
 	return sample;
 }
 
+
+/*
+ * An HEVC session at its first picture: the block's if it is a video's (real time asked for, a frame rate given, or a video's size),
+ * VideoToolbox's otherwise (the photographs' HEIC, made by CMPhoto). Under the lock.
+ */
+static void
+decide(struct enc_session *e, CVImageBufferRef image)
+{
+	if (e->decided) {
+		return;
+	}
+	e->decided = true;
+	size_t w = image != NULL ? CVPixelBufferGetWidth(image) : (size_t)e->width, h = image != NULL ? CVPixelBufferGetHeight(image) : (size_t)e->height;
+	size_t big = w > h ? w : h, small = w > h ? h : w;
+	bool video_size = (big == 1920 && small == 1080) || (big == 1280 && small == 720) || (big == 3840 && small == 2160) || (big == 640 && small == 480);
+	bool video = e->realtime || e->fps_given || video_size;
+
+	if (video) {
+		e->fd = open_device();
+		e->mine = e->fd >= 0;
+	}
+	say("HEVC session %p, %zux%zu (real time %d, frame rate %s, a video's size %d): %s", (void *)e->session, w, h, e->realtime,
+	    e->fps_given ? "given" : "not given", video_size, e->mine ? "the MFC's" : video ? "VideoToolbox's (no /dev/hakios-mfcenc)" :
+	    "VideoToolbox's (not a video)");
+}
+
 static OSStatus
 hk_VTCompressionSessionEncodeFrame(VTCompressionSessionRef session, CVImageBufferRef image, CMTime pts, CMTime duration,
     CFDictionaryRef options, void *frame_refcon, VTEncodeInfoFlags *info)
@@ -515,8 +692,12 @@ hk_VTCompressionSessionEncodeFrame(VTCompressionSessionRef session, CVImageBuffe
 	pthread_mutex_lock(&lock);
 	struct enc_session *e = find(session);
 
-	if (e == NULL) {
+	if (e != NULL) {
+		decide(e, image);
+	}
+	if (e == NULL || !e->mine) {
 		pthread_mutex_unlock(&lock);
+		FIRST("VTCompressionSessionEncodeFrame");
 		return VTCompressionSessionEncodeFrame(session, image, pts, duration, options, frame_refcon, info);
 	}
 	OSStatus status;
@@ -548,8 +729,12 @@ hk_VTCompressionSessionEncodeFrameWithOutputHandler(VTCompressionSessionRef sess
 	pthread_mutex_lock(&lock);
 	struct enc_session *e = find(session);
 
-	if (e == NULL) {
+	if (e != NULL) {
+		decide(e, image);
+	}
+	if (e == NULL || !e->mine) {
 		pthread_mutex_unlock(&lock);
+		FIRST("VTCompressionSessionEncodeFrameWithOutputHandler");
 		return VTCompressionSessionEncodeFrameWithOutputHandler(session, image, pts, duration, options, info, handler);
 	}
 	OSStatus status = kVTParameterErr;
@@ -571,6 +756,10 @@ hk_VTCompressionSessionEncodeFrameWithOutputHandler(VTCompressionSessionRef sess
 __attribute__((used)) static const struct { const void *replacement, *replacee; } hakios_mfcenc_interposers[]
     __attribute__((section("__DATA,__interpose"))) = {
 	{ (const void *)hk_VTCompressionSessionCreate, (const void *)VTCompressionSessionCreate },
+	{ (const void *)hk_VTCompressionSessionCreateWithOptions, (const void *)VTCompressionSessionCreateWithOptions },
+	{ (const void *)hk_VTCompressionSessionSetProperty, (const void *)VTCompressionSessionSetProperty },
+	{ (const void *)hk_VTCompressionSessionSetProperties, (const void *)VTCompressionSessionSetProperties },
+	{ (const void *)hk_VTCompressionSessionCopyProperty, (const void *)VTCompressionSessionCopyProperty },
 	{ (const void *)hk_VTSessionSetProperty, (const void *)VTSessionSetProperty },
 	{ (const void *)hk_VTSessionSetProperties, (const void *)VTSessionSetProperties },
 	{ (const void *)hk_VTSessionCopyProperty, (const void *)VTSessionCopyProperty },
