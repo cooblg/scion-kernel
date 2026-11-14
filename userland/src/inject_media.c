@@ -741,6 +741,20 @@ hakios_media_init(void)
 	}
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
 	crash_handler_arm();
+	/*
+	 * The capture graph says which of its sink nodes it waited for when a stop times out ("Not all sink nodes became idle
+	 * after waiting 10s", then a trap) only with its trace category on: FigNote's "bwgraph_trace" in com.apple.coremedia,
+	 * read from the preferences when CMCapture first logs. Set here, before that, for finding the node.
+	 */
+	{
+		int one = 1;
+		CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &one);
+
+		CFPreferencesSetAppValue(CFSTR("bwgraph_trace"), n, CFSTR("com.apple.coremedia"));
+		CFPreferencesAppSynchronize(CFSTR("com.apple.coremedia"));
+		CFRelease(n);
+		say("hakios: mediaserverd: com.apple.coremedia bwgraph_trace = 1 (the capture graph's trace)\n");
+	}
 	metal_left_alone = boot_arg("mediamtl=1");
 	if (metal_left_alone) {
 		say("hakios: mediaserverd: mediamtl=1: the capture stack may have the Metal device (it "
