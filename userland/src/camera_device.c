@@ -1512,7 +1512,7 @@ worker(void *context)
 				t_n = 0; t_read = t_an = t_ren = 0; t_win = 0;
 			}
 		}
-		if (s->frames == 1 || s->frames % 300 == 0) {
+		if (s->frames == 1 || s->frames % 90 == 0) {
 			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black; white balance R %.2f "
 			    "B %.2f, lux index %.0f, about %.0f K", f->sequence, f->exposure_lines * (double)f->line_ns / 1e6,
 			    (double)f->gain / f->gain_unity, isp.digital, st.mean[1], isp.wb[0], isp.wb[2], lux, cct);

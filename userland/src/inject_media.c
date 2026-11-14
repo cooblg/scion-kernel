@@ -793,6 +793,18 @@ wait_for_mfc(void *unused)
  */
 static IMP original_audio_source_stop;
 
+static const void *
+kept_retain(__unused CFAllocatorRef allocator, const void *value)
+{
+	return CFRetain(value);
+}
+
+static void
+kept_release(__unused CFAllocatorRef allocator, const void *value)
+{
+	CFRelease(value);
+}
+
 static void
 audio_source_end(void *context)
 {
@@ -806,7 +818,13 @@ audio_source_end(void *context)
 		if (send0(out, "liveFormat") != nil) {
 			pthread_mutex_lock(&ended_lock);
 			if (ended_outputs == NULL) {
-				ended_outputs = CFSetCreateMutable(NULL, 0, NULL);
+				/*
+				 * Each output kept (retained) while in the set: a node freed with its graph and another's output made
+				 * at the same address would have had its buffers dropped (the video's, after a photo<->video switch).
+				 */
+				static const CFSetCallBacks kept = { 0, kept_retain, kept_release, NULL, NULL, NULL };
+
+				ended_outputs = CFSetCreateMutable(NULL, 0, &kept);
 			}
 			CFSetAddValue(ended_outputs, (const void *)out);
 			pthread_mutex_unlock(&ended_lock);

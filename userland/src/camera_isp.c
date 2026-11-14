@@ -12,7 +12,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <stdio.h>
 #include "camera_isp.h"
+
+/* mediaserverd's log (camera_device.c) when it is there; camera_test has stderr */
+void hakios_camera_say(const char *format, ...) __attribute__((weak, format(printf, 1, 2)));
 
 #define WHITE           959             /* 1023 less the black level of 64 */
 #define LUT_WHITE       3836            /* WHITE in the gamma table's steps */
@@ -226,8 +230,27 @@ isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_st
 	double digital = 1;
 
 	if (isp->asked && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain)) {
-		return false;                   /* (the last change not in the frames yet) */
+		/*
+		 * (the last change not in the frames yet) -- but not for ever: in the video format (1920x1080,
+		 * 15 November) the frames never carried what was asked and AE stopped with the picture black (mean Y
+		 * 1-4 for ten seconds). After 8 frames the frame's own exposure is taken as where things are.
+		 */
+		if (++isp->stale < 8) {
+			return false;
+		}
+		if (isp->stale_said < 4) {
+			isp->stale_said++;
+#define AE_STALE "AE: asked lines %u gain %u, the frames carry lines %u gain %u (of unity %u, max %u): going on from those"
+			if (hakios_camera_say != NULL) {
+				hakios_camera_say(AE_STALE, isp->asked_lines, isp->asked_gain, f->exposure_lines, f->gain, f->gain_unity, f->gain_max);
+			} else {
+				fprintf(stderr, AE_STALE "\n", isp->asked_lines, isp->asked_gain, f->exposure_lines, f->gain, f->gain_unity,
+				    f->gain_max);
+			}
+		}
+		isp->asked = false;
 	}
+	isp->stale = 0;
 	/* (the measured levels are the sensor's: digital gain is applied to the picture only) */
 	ratio = target / mean;
 	if (bright * ratio > 0.9 * WHITE && bright > 0) {
