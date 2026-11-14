@@ -75,6 +75,7 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 #define CACHE_BASE 0x180000000UL                /* where the cache was built to be, before the slide */
 
 static uintptr_t slide;
+static id send0(id o, const char *sel);
 static CFMutableSetRef ended_outputs;           /* outputs we marked ended: their later buffers are dropped */
 static pthread_mutex_t ended_lock = PTHREAD_MUTEX_INITIALIZER;
 static CFMutableSetRef stopped_sources;         /* audio source nodes stopped and not started again (under ended_lock) */
@@ -285,6 +286,15 @@ audio_source_start(id self, SEL selector, id *error)
 	if (stopped_sources != NULL) {
 		CFSetRemoveValue(stopped_sources, (const void *)self);         /* running again */
 	}
+	if (ended_outputs != NULL) {
+		id outs = send0(self, "outputs");
+		long n = outs != nil ? ((long (*)(id, SEL))objc_msgSend)(outs, sel_registerName("count")) : 0;
+
+		for (long i = 0; i < n; i++) {
+			CFSetRemoveValue(ended_outputs, (const void *)((id (*)(id, SEL, long))objc_msgSend)(outs,
+			    sel_registerName("objectAtIndex:"), i));
+		}
+	}
 	pthread_mutex_unlock(&ended_lock);
 	started = ((BOOL (*)(id, SEL, id *))original_audio_source_start)(self, selector, error);
 	made = error != NULL ? *error : NULL;
@@ -417,15 +427,8 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 		bool drop = false;
 
 		pthread_mutex_lock(&ended_lock);
-		if (CFSetContainsValue(ended_outputs, (const void *)self)) {
-			Ivar lf = class_getInstanceVariable(object_getClass(self), "_liveFormat");
-
-			if (lf != NULL && object_getIvar(self, lf) == nil) {
-				drop = true;            /* the audio source, still running after its stop: not after its end */
-			} else {
-				CFSetRemoveValue(ended_outputs, (const void *)self);   /* live again: a new session */
-			}
-		}
+		/* until its node is started again (audio_source_start takes its outputs out of the set) */
+		drop = CFSetContainsValue(ended_outputs, (const void *)self);
 		pthread_mutex_unlock(&ended_lock);
 		if (drop) {
 			static bool said_drop;
