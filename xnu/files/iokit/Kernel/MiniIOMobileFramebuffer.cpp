@@ -2298,6 +2298,31 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	fStatWaiting += mach_absolute_time() - began;
+	/*
+	 * How much is drawn while the panel sleeps (the screen off): counted only, nothing changed -- whether iOS keeps sending
+	 * frames then (battery, heat), said once at the wake. (A skip here panicked in step 90: measured first.)
+	 */
+	{
+		static bool asleep_seen;
+		static uint32_t asleep_frames;
+		static uint64_t asleep_since;
+
+		if (hakios_panel_asleep()) {
+			if (!asleep_seen) {
+				asleep_seen = true;
+				asleep_frames = 0;
+				asleep_since = mach_absolute_time();
+			}
+			asleep_frames++;
+		} else if (asleep_seen) {
+			uint64_t ns;
+
+			asleep_seen = false;
+			absolutetime_to_nanoseconds(mach_absolute_time() - asleep_since, &ns);
+			IOLog("MiniIOMobileFramebuffer: %u frames drawn while the panel slept, over %llu ms before this one\n",
+			    asleep_frames, ns / NSEC_PER_MSEC);
+		}
+	}
 	began = ready = mach_absolute_time();
 	if (gOnTheBeat) {
 		uint64_t period, aim, next;
