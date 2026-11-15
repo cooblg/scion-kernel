@@ -2290,6 +2290,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	bool inPlace;                           /* (fb_zc: the surface scanned out as it is: drawLayer() draws nothing) */
 	bool report;
 
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
+			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
+			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
+			undrawn++;
+		}
+	}
+	fStatWaiting += mach_absolute_time() - began;
 	/*
 	 * The panel asleep (the screen off: hakios.s6e3ha8.c): nothing reaches it and the DECON takes no flip. The frame is
 	 * taken as shown and not drawn -- not drawn into a scan-out buffer to wait on a flip that cannot come (scanLatch), and
@@ -2300,14 +2308,6 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		markShown(swapWord(swap, SWAP_ID));
 		return;
 	}
-	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
-		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
-			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
-			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
-			undrawn++;
-		}
-	}
-	fStatWaiting += mach_absolute_time() - began;
 	began = ready = mach_absolute_time();
 	if (gOnTheBeat) {
 		uint64_t period, aim, next;
