@@ -768,6 +768,7 @@ keep_metal_from_the_capture_stack(void)
  * may be after this process starts; a thread waits a minute for it and goes.
  */
 extern void hakios_mfc_decoder_register(void);
+extern void hakios_mfc_encoder_register(void);
 
 static void *
 wait_for_mfc(void *unused)
@@ -1093,6 +1094,7 @@ hakios_media_init(void)
 		say("hakios: mediaserverd: the kernel has a camera (/dev/hakios-camera)\n");
 		register_hevc_encoder();
 	}
+	hakios_mfc_encoder_register();          /* (after VCPHEVC's: an HEVC session not a video's size is handed to it) */
 	if (boot_arg("mfc=")) {
 		pthread_t waiter;
 
