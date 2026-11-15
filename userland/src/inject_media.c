@@ -453,7 +453,7 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 		static unsigned audio_n, video_n;
 		unsigned n = type == kCMMediaType_Audio ? ++audio_n : type == kCMMediaType_Video ? ++video_n : 0;
 
-		if ((type == kCMMediaType_Audio && n % 100 == 1) || (type == kCMMediaType_Video && n % 150 == 1)) {
+		if ((type == kCMMediaType_Audio && (n % 100 == 1 || (n <= 300 && n % 10 == 1))) || (type == kCMMediaType_Video && n % 150 == 1)) {
 			CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample_buffer);
 			double now = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()));
 			id node = send0(self, "node");
@@ -463,6 +463,26 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 			    type == kCMMediaType_Audio ? "audio" : "video", n, name != nil ?
 			    ((const char *(*)(id, SEL))objc_msgSend)(name, sel_registerName("UTF8String")) : "?",
 			    CMTimeGetSeconds(pts), now - CMTimeGetSeconds(pts));
+			if (type == kCMMediaType_Audio) {
+				/* what the buffer says of itself, and (from the audio source) how much of it the silence path made */
+				const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(f);
+				long long silence = -1;
+				Class asn = objc_getClass("BWAudioSourceNode");
+
+				if (node != nil && asn != Nil && ((BOOL (*)(id, SEL, Class))objc_msgSend)(node, sel_registerName("isKindOfClass:"), asn)) {
+					Ivar sv = class_getInstanceVariable(asn, "_silenceFramesGeneratedSinceLastAURenderProc");
+
+					if (sv != NULL) {
+						silence = *(long long *)((uintptr_t)node + (uintptr_t)ivar_getOffset(sv));
+					}
+				}
+				say("hakios: mediaserverd: lag: that audio buffer: %ld frames, %.4f s long, %.0f Hz %u ch (format '%c%c%c%c'), "
+				    "node %s, silence frames since the last render %lld\n", (long)CMSampleBufferGetNumSamples(sample_buffer),
+				    CMTimeGetSeconds(CMSampleBufferGetDuration(sample_buffer)), asbd ? asbd->mSampleRate : 0.0,
+				    asbd ? (unsigned)asbd->mChannelsPerFrame : 0, asbd ? (char)(asbd->mFormatID >> 24) : '?',
+				    asbd ? (char)(asbd->mFormatID >> 16) : '?', asbd ? (char)(asbd->mFormatID >> 8) : '?',
+				    asbd ? (char)asbd->mFormatID : '?', node != nil ? object_getClassName(node) : "?", silence);
+			}
 		}
 	}
 	((void (*)(id, SEL, CMSampleBufferRef))original_emit_sample_buffer)(self, selector, sample_buffer);

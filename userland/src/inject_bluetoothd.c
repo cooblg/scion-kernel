@@ -17,6 +17,7 @@
  * is dropped instead of stopping the stack. iAP itself goes nowhere (there is no accessory server); A2DP, AVRCP and
  * HFP do not use the PTY.
  */
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -123,8 +124,14 @@ h4_fill(void)
 	uint8_t *table = (uint8_t *)(0x100844218UL + (uintptr_t)slide);
 	const char *name = *(const char **)(table + 8);
 	void **entry = (void **)(table + 96);
+	uintptr_t lo = 0x100000000UL + (uintptr_t)slide, hi = lo + 0x900000;
 
-	if (name == NULL || strcmp(name, "H4") != 0 || *(uint32_t *)table != 1 || *entry != NULL) {
+	/* (read only once bluetoothd's own pointers are fixed up -- in the constructor they were not: step 88 died in strcmp) */
+	if ((uintptr_t)name < lo || (uintptr_t)name >= hi) {
+		say("libhakios.bluetoothd: the H4 transport's name pointer %p is not in bluetoothd: its +96 left alone\n", name);
+		return;
+	}
+	if (strcmp(name, "H4") != 0 || *(uint32_t *)table != 1 || *entry != NULL) {
 		say("libhakios.bluetoothd: the H4 transport's table is not as read (%s, %u, %p): its +96 left alone\n",
 		    name != NULL ? name : "?", *(uint32_t *)table, *entry);
 		return;
@@ -149,7 +156,10 @@ hello(void)
 		sigaction(signals[i], &action, NULL);
 	}
 	say("libhakios.bluetoothd: in bluetoothd (pid %d): openpty's central end non-blocking; the crash reporter of ours armed\n", getpid());
-	h4_fill();
+	/* two seconds on: bluetoothd's own initializers have run, its pointers are fixed up, and no power-off comes that soon */
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+		h4_fill();
+	});
 }
 
 static int
