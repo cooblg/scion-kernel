@@ -885,6 +885,34 @@ generate_samples(id self, SEL selector)
 	((void (*)(id, SEL))original_generate_samples)(self, selector);
 }
 
+/*
+ * With the microphone working (abox_mic=1), the node's audio unit still delivers a buffer or two after the stop, and each one
+ * runs -[BWAudioSourceNode makeOutputsLiveIfNeeded], which, on a queue of its own, makes the outputs live again -- the outputs
+ * audio_source_end has just ended -- and sends the live message to the node downstream, which the graph has freed by then
+ * (SIGSEGV in objc_msgSend from -[BWNodeOutput makeConfiguredFormatLive], a second after a 10 s recording's stop, 15 November;
+ * the movie never finished). A node stopped and not started again makes nothing live.
+ */
+static IMP original_make_outputs_live;
+
+static void
+make_outputs_live(id self, SEL selector)
+{
+	bool stopped;
+
+	pthread_mutex_lock(&ended_lock);
+	stopped = stopped_sources != NULL && CFSetContainsValue(stopped_sources, (const void *)self);
+	pthread_mutex_unlock(&ended_lock);
+	if (stopped) {
+		static int said;
+
+		if (said++ < 3) {
+			say("hakios: mediaserverd: the audio source was asked to make its outputs live after its stop: not done\n");
+		}
+		return;
+	}
+	((void (*)(id, SEL))original_make_outputs_live)(self, selector);
+}
+
 static void
 wrap_audio_source_stop(void)
 {
@@ -915,6 +943,20 @@ wrap_audio_source_stop(void)
 			say("hakios: mediaserverd: -[BWAudioSourceNode _generateSamples] (%s) wrapped: nothing after a stop\n", types);
 		} else {
 			say("hakios: mediaserverd: -[BWAudioSourceNode _generateSamples]: %s; left alone\n", gm ? types : "not there");
+		}
+	}
+	{
+		SEL l = sel_registerName("makeOutputsLiveIfNeeded");
+		Method lm = class_getInstanceMethod(cls, l);
+		const char *types = lm != NULL ? method_getTypeEncoding(lm) : NULL;
+
+		if (types != NULL && types[0] == 'v' && strchr(types, ':') != NULL && strspn(strchr(types, ':') + 1, "0123456789") ==
+		    strlen(strchr(types, ':') + 1)) {
+			original_make_outputs_live = method_getImplementation(lm);
+			class_replaceMethod(cls, l, (IMP)make_outputs_live, types);
+			say("hakios: mediaserverd: -[BWAudioSourceNode makeOutputsLiveIfNeeded] (%s) wrapped: nothing after a stop\n", types);
+		} else {
+			say("hakios: mediaserverd: -[BWAudioSourceNode makeOutputsLiveIfNeeded]: %s; left alone\n", lm ? types : "not there");
 		}
 	}
 }
