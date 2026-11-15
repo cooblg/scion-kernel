@@ -609,6 +609,78 @@ panel_dsc(void)
 	return ok;
 }
 
+/*
+ * What the boot loader set in the panel, read before its first sleep and written back at every wake: the registers of
+ * Samsung's init that are not sent here otherwise, whose values depend on the link (FFC: the panel's receiver for this
+ * DSI clock) or on the panel (ISC, edge dimming, the error flag's mode, the touch sync, the scaler). The woken panel
+ * showed black horizontal lines and filled gaps between them, pixels fully off (step 92, 16 November), with DSC, PPS,
+ * CASET/PASET and TE all sent again: something else of the boot loader's was gone. Reading them is also how their
+ * values here are known at all (they are logged next to Samsung's defaults for crown_a3_s0).
+ */
+static struct panel_reg {
+	uint8_t reg, len;               /* the register and its parameters' bytes (Samsung's arrays less the opcode) */
+	const char *what;
+	uint8_t val[12];
+	bool have;
+} panel_regs[] = {
+	{ 0xC5, 5, "FFC (Samsung C5 0D 10 B4 3E 01)", { 0 }, false },
+	{ 0xF6, 1, "ISC (F6 43)", { 0 }, false },
+	{ 0xC2, 6, "edge dimming (C2 09 00 D8 D8 F4 F4)", { 0 }, false },
+	{ 0xED, 1, "ERR_FG (ED 4C)", { 0 }, false },
+	{ 0xB9, 9, "TSP_HSYNC (B9 01 B0 91 09 00 00 00 11 03)", { 0 }, false },
+	{ 0xBA, 5, "scaler (BA 01 26 08 08 F3)", { 0 }, false },
+};
+static bool panel_regs_taken;
+
+/* panel_lock held, the panel awake and as the boot loader left it */
+static void
+panel_regs_take(void)
+{
+	char line[96];
+
+	panel_regs_taken = true;
+	if (!panel_keys(true)) {
+		(void)panel_keys(false);
+		say("s6e3ha8: the boot loader's registers not read (the keys not opened)\n");
+		return;
+	}
+	for (size_t i = 0; i < sizeof(panel_regs) / sizeof(panel_regs[0]); i++) {
+		struct panel_reg *r = &panel_regs[i];
+		size_t at = 0;
+
+		r->have = panel_read(r->reg, r->val, r->len);
+		for (uint32_t k = 0; r->have && k < r->len && at + 4 < sizeof(line); k++) {
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " %02X", r->val[k]);
+		}
+		say("s6e3ha8: the boot loader's %02X, %s:%s\n", r->reg, r->what, r->have ? line : " NOT READ (not written back)");
+	}
+	(void)panel_keys(false);
+}
+
+/* panel_lock held, after a sleep-out: what panel_regs_take read, written back */
+static bool
+panel_regs_put(void)
+{
+	bool ok;
+
+	if (!panel_regs_taken) {
+		return true;
+	}
+	ok = panel_keys(true);
+	for (size_t i = 0; ok && i < sizeof(panel_regs) / sizeof(panel_regs[0]); i++) {
+		uint8_t buf[1 + sizeof(panel_regs[0].val)];
+
+		if (!panel_regs[i].have) {
+			continue;
+		}
+		buf[0] = panel_regs[i].reg;
+		memcpy(buf + 1, panel_regs[i].val, panel_regs[i].len);
+		ok = dsim_send(buf, 1u + panel_regs[i].len) && ok;
+	}
+	ok = panel_keys(false) && ok;
+	return ok;
+}
+
 /* after a sleep-out, panel_lock held: what Samsung's init sets after its own sleep-out, for 1440x2960 */
 static bool
 panel_restore(void)
@@ -662,6 +734,7 @@ panel_display(int on)
 		delay(120 * 1000);              /* the sleep-out's own wait before the next command */
 		lck_mtx_lock(panel_lock);
 		bool restored = panel_restore();
+		bool put = panel_regs_put();    /* (after panel_restore: the boot loader's own scaler wins over Samsung's) */
 
 		ok = restored && ok;
 		/* the brightness again (panel_set takes the lock itself) */
@@ -676,10 +749,15 @@ panel_display(int on)
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(display_on, 1) && ok;
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
 		panel_asleep = false;
-		say("s6e3ha8: woken: DSC and PPS %s; scaler, CASET/PASET 1440x2960, SET_AREA, TE on %s; brightness %d again\n",
-		    dsc ? "sent" : "NOT SENT", restored ? "sent" : "NOT ALL SENT", panel_level);
+		say("s6e3ha8: woken: DSC and PPS %s; scaler, CASET/PASET 1440x2960, SET_AREA, TE on %s; the boot loader's registers %s; "
+		    "brightness %d again\n", dsc ? "sent" : "NOT SENT", restored ? "sent" : "NOT ALL SENT",
+		    !panel_regs_taken ? "not read" : put ? "written back" : "NOT ALL WRITTEN", panel_level);
 	} else if (!on && panel_sleep) {
 		static const uint8_t sleep_in[] = { 0x10 };
+
+		if (!panel_regs_taken) {
+			panel_regs_take();      /* (the first sleep of the run: the panel still as the boot loader set it up) */
+		}
 
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(display_off, 1);
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
