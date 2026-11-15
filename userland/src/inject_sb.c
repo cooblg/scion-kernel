@@ -726,6 +726,47 @@ battery_post_notifications(void)
 	});
 }
 
+/*
+ * Bluetooth in Control Center: its button stays greyed out whatever bluetoothd's state (step 87, 16 November), while Settings
+ * switches it. Control Center's module asks BluetoothManager (BluetoothManager.framework), so what that says is logged: at
+ * 20 s, then every 30 s for five minutes, and whenever it changes -- available, enabled, powered, and its state number.
+ */
+static void
+bt_watch(int round)
+{
+	static char last[160];
+	char line[160];
+	Class bm = objc_getClass("BluetoothManager");
+
+	if (bm == Nil) {
+		dlopen("/System/Library/PrivateFrameworks/BluetoothManager.framework/BluetoothManager", RTLD_NOW);
+		bm = objc_getClass("BluetoothManager");
+	}
+	id m = bm != Nil ? ((id (*)(Class, SEL))objc_msgSend)(bm, sel_registerName("sharedInstance")) : nil;
+
+	if (m == nil) {
+		snprintf(line, sizeof(line), "no BluetoothManager (%s)", bm == Nil ? "no class" : "no shared instance");
+	} else {
+		SEL av = sel_registerName("available"), en = sel_registerName("enabled"), pw = sel_registerName("powered"),
+		    st = sel_registerName("bluetoothState");
+		int a = class_respondsToSelector(object_getClass(m), av) ? ((BOOL (*)(id, SEL))objc_msgSend)(m, av) : -1;
+		int e = class_respondsToSelector(object_getClass(m), en) ? ((BOOL (*)(id, SEL))objc_msgSend)(m, en) : -1;
+		int p = class_respondsToSelector(object_getClass(m), pw) ? ((BOOL (*)(id, SEL))objc_msgSend)(m, pw) : -1;
+		long t = class_respondsToSelector(object_getClass(m), st) ? ((long (*)(id, SEL))objc_msgSend)(m, st) : -1;
+
+		snprintf(line, sizeof(line), "available %d, enabled %d, powered %d, state %ld", a, e, p, t);
+	}
+	if (round == 0 || round % 10 == 0 || strcmp(line, last) != 0) {
+		say("hakios: bluetooth: BluetoothManager in SpringBoard: %s\n", line);
+		strlcpy(last, line, sizeof(last));
+	}
+	if (round < 100) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			bt_watch(round + 1);
+		});
+	}
+}
+
 /* ---- the lock screen's clock without a GPU ------------------------------------------------------- */
 
 #define HAKIOS_GL "/redwood/lib/libhakios.gl.dylib"
@@ -3135,6 +3176,9 @@ hakios_springboard_init(void)
 		    sysctl_int("kern.hakios.battery_soc"), sysctl_int("kern.hakios.battery_present"),
 		    sysctl_int("kern.hakios.battery_charger_present"), sysctl_int("kern.hakios.battery_charging"));
 		battery_post_notifications();
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			bt_watch(0);
+		});
 	});
 	notify_register_dispatch("com.hakios.unlock", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		unlock();

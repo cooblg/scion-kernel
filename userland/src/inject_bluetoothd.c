@@ -101,6 +101,38 @@ crash_handler(int sig, siginfo_t *info, void *context)
 	signal(sig, SIG_DFL);
 }
 
+/*
+ * The power-off from Settings: bluetoothd's stack shutdown (0x1000f3970 of 20F66's bluetoothd) calls the HCI transport's
+ * entry at +96 (0x1000e656c: "if the transport's first word is not 0, branch to its +96") without looking whether it is
+ * there -- and the transport this phone gets, "H4" (a UART: BT_HCI_TRANSPORT unset, "Searching for transport: \"H4\""), has
+ * first word 1 and NULL at +96 (the iPhones use PCIE, whose table has it). bluetoothd jumped to 0 at every power-off
+ * (SIGSEGV at address 0, step 87, 16 November), was started again by launchd, and the switch in Settings took that long.
+ * The entry is given a function that does nothing and answers 0, in the H4 table only, and only if it is what was read here:
+ * the table at 0x100844218 named "H4", first word 1, +96 NULL.
+ */
+static int
+h4_nothing(void)
+{
+	return 0;
+}
+
+static void
+h4_fill(void)
+{
+	intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+	uint8_t *table = (uint8_t *)(0x100844218UL + (uintptr_t)slide);
+	const char *name = *(const char **)(table + 8);
+	void **entry = (void **)(table + 96);
+
+	if (name == NULL || strcmp(name, "H4") != 0 || *(uint32_t *)table != 1 || *entry != NULL) {
+		say("libhakios.bluetoothd: the H4 transport's table is not as read (%s, %u, %p): its +96 left alone\n",
+		    name != NULL ? name : "?", *(uint32_t *)table, *entry);
+		return;
+	}
+	*entry = (void *)h4_nothing;
+	say("libhakios.bluetoothd: the H4 transport's +96 (called at power-off, NULL in 20F66) given a function that does nothing\n");
+}
+
 __attribute__((constructor)) static void
 hello(void)
 {
@@ -117,6 +149,7 @@ hello(void)
 		sigaction(signals[i], &action, NULL);
 	}
 	say("libhakios.bluetoothd: in bluetoothd (pid %d): openpty's central end non-blocking; the crash reporter of ours armed\n", getpid());
+	h4_fill();
 }
 
 static int
