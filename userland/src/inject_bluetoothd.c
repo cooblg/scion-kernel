@@ -17,8 +17,15 @@
  * is dropped instead of stopping the stack. iAP itself goes nowhere (there is no accessory server); A2DP, AVRCP and
  * HFP do not use the PTY.
  */
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/ucontext.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <termios.h>
@@ -40,10 +47,76 @@ say(const char *format, ...)
 	}
 }
 
+/*
+ * bluetoothd died of SIGSEGV while its stack stopped for a power-off from Settings ("Terminating stack...", 15 November), and this
+ * phone has no crash reporter: the daemon says where it was (as inject_media.c's does for mediaserverd), the fault's address, the
+ * frames from pc, lr and the frame pointers' chain, each as image, symbol, offset in the image, and the cache address. Then the
+ * default action is put back and the fault happens again.
+ */
+extern const void *_dyld_get_shared_cache_range(size_t *length);
+static uintptr_t slide;
+
+static void
+crash_handler(int sig, siginfo_t *info, void *context)
+{
+	ucontext_t *uc = context;
+	uintptr_t pc = 0, lr = 0, fp = 0, lo, hi;
+	pthread_t self = pthread_self();
+	char thread[64] = "?";
+
+	pthread_getname_np(self, thread, sizeof(thread));
+	if (uc != NULL && uc->uc_mcontext != NULL) {
+		pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+		lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(uc->uc_mcontext->__ss);
+		fp = (uintptr_t)__darwin_arm_thread_state64_get_fp(uc->uc_mcontext->__ss);
+	}
+	hi = (uintptr_t)pthread_get_stackaddr_np(self);
+	lo = hi - pthread_get_stacksize_np(self);
+	say("hakios: bluetoothd: CRASH, signal %d at address %p on thread '%s'; frames follow\n", sig, info != NULL ? info->si_addr : NULL,
+	    thread);
+	for (int i = 0; i < 40; i++) {
+		uintptr_t addr = i == 0 ? pc : i == 1 ? lr : 0;
+		Dl_info d;
+
+		if (i >= 2) {
+			if (fp < lo || fp + 16 > hi || (fp & 15) != 0) {
+				break;
+			}
+			addr = ((uintptr_t *)fp)[1];
+			fp = ((uintptr_t *)fp)[0];
+		}
+		if (addr == 0) {
+			continue;
+		}
+		if (dladdr((void *)addr, &d) && d.dli_fname != NULL) {
+			const char *base = strrchr(d.dli_fname, '/');
+
+			say("hakios: bluetoothd:   #%d %s %s+%lu (image offset %#lx, cache address %#lx)\n", i, base ? base + 1 : d.dli_fname,
+			    d.dli_sname ? d.dli_sname : "?", d.dli_sname ? (unsigned long)(addr - (uintptr_t)d.dli_saddr) : 0UL,
+			    (unsigned long)(addr - (uintptr_t)d.dli_fbase), (unsigned long)(addr - slide));
+		} else {
+			say("hakios: bluetoothd:   #%d %#lx\n", i, (unsigned long)addr);
+		}
+	}
+	signal(sig, SIG_DFL);
+}
+
 __attribute__((constructor)) static void
 hello(void)
 {
-	say("libhakios.bluetoothd: in bluetoothd (pid %d): openpty's central end non-blocking\n", getpid());
+	struct sigaction action;
+	static const int signals[] = { SIGTRAP, SIGSEGV, SIGBUS, SIGILL, SIGABRT };
+	size_t length = 0;
+
+	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - 0x180000000UL;
+	memset(&action, 0, sizeof(action));
+	action.sa_sigaction = crash_handler;
+	action.sa_flags = SA_SIGINFO | SA_NODEFER | SA_RESETHAND;
+	sigemptyset(&action.sa_mask);
+	for (unsigned i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
+		sigaction(signals[i], &action, NULL);
+	}
+	say("libhakios.bluetoothd: in bluetoothd (pid %d): openpty's central end non-blocking; the crash reporter of ours armed\n", getpid());
 }
 
 static int
