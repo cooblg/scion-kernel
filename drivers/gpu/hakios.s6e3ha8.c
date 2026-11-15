@@ -581,6 +581,34 @@ hakios_panel_asleep(void)
 }
 SYSCTL_INT(_kern_hakios, OID_AUTO, panel_sleep, CTLFLAG_RW | CTLFLAG_LOCKED, &panel_sleep, 0, "display-off also sleeps the panel");
 
+/*
+ * Before the sleep-out, panel_lock held: the compression (DSC) the panel decodes the DECON's stream with -- MIPI's
+ * Compression Mode (data type 0x07: on) and the Picture Parameter Set (0x0A, 128 bytes) -- as Samsung's init sends them
+ * first (level-1 key, DSC, PPS, key off, then SLEEP_OUT). Without them the woken panel showed black lines and smudges
+ * (step 91, 16 November): it decoded with what it had after the sleep. The PPS is crown_a3_s0_pps_table's row for
+ * 1440x2960 ("DSU MODE 1 ... Slice Info : 720x40"; bytes 6-9: 2960 rows, 1440 columns), the mode the DECON drives.
+ */
+static bool
+panel_dsc(void)
+{
+	static const uint8_t l1_on[] = { 0x9F, 0xA5, 0xA5 }, l1_off[] = { 0x9F, 0x5A, 0x5A };
+	static const uint8_t pps[128] = {
+		0x11, 0x00, 0x00, 0x89, 0x30, 0x80, 0x0B, 0x90, 0x05, 0xA0, 0x00, 0x28, 0x02, 0xD0, 0x02, 0xD0,
+		0x02, 0x00, 0x02, 0x68, 0x00, 0x20, 0x04, 0x6C, 0x00, 0x0A, 0x00, 0x0C, 0x02, 0x77, 0x01, 0xE9,
+		0x18, 0x00, 0x10, 0xF0, 0x03, 0x0C, 0x20, 0x00, 0x06, 0x0B, 0x0B, 0x33, 0x0E, 0x1C, 0x2A, 0x38,
+		0x46, 0x54, 0x62, 0x69, 0x70, 0x77, 0x79, 0x7B, 0x7D, 0x7E, 0x01, 0x02, 0x01, 0x00, 0x09, 0x40,
+		0x09, 0xBE, 0x19, 0xFC, 0x19, 0xFA, 0x19, 0xF8, 0x1A, 0x38, 0x1A, 0x78, 0x1A, 0xB6, 0x2A, 0xF6,
+		0x2B, 0x34, 0x2B, 0x74, 0x3B, 0x74, 0x6B, 0xF4,
+	};
+	bool ok;
+
+	ok = dsim_send(l1_on, sizeof(l1_on));
+	ok = ok && dsim_packet(0x07 | 0x01u << 8, NULL, 0);                                 /* Compression Mode: DSC on */
+	ok = ok && dsim_packet(0x0A | (uint32_t)(sizeof(pps) & 0xff) << 8 | (uint32_t)(sizeof(pps) >> 8) << 16, pps, sizeof(pps));
+	ok = dsim_send(l1_off, sizeof(l1_off)) && ok;
+	return ok;
+}
+
 /* after a sleep-out, panel_lock held: what Samsung's init sets after its own sleep-out, for 1440x2960 */
 static bool
 panel_restore(void)
@@ -626,8 +654,9 @@ panel_display(int on)
 	 */
 	if (on && panel_asleep) {
 		static const uint8_t sleep_out[] = { 0x11 };
+		bool dsc = panel_dsc();
 
-		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(sleep_out, 1);
+		ok = dsc && dsim_send(key_on, sizeof(key_on)) && dsim_send(sleep_out, 1);
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
 		lck_mtx_unlock(panel_lock);
 		delay(120 * 1000);              /* the sleep-out's own wait before the next command */
@@ -647,8 +676,8 @@ panel_display(int on)
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(display_on, 1) && ok;
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
 		panel_asleep = false;
-		say("s6e3ha8: woken: scaler, CASET/PASET 1440x2960, SET_AREA, TE on %s; brightness %d again\n",
-		    restored ? "sent" : "NOT ALL SENT", panel_level);
+		say("s6e3ha8: woken: DSC and PPS %s; scaler, CASET/PASET 1440x2960, SET_AREA, TE on %s; brightness %d again\n",
+		    dsc ? "sent" : "NOT SENT", restored ? "sent" : "NOT ALL SENT", panel_level);
 	} else if (!on && panel_sleep) {
 		static const uint8_t sleep_in[] = { 0x10 };
 
