@@ -863,6 +863,26 @@ audio_source_stop(id self, SEL selector, id *error)
 	pthread_mutex_unlock(&ended_lock);
 	CFRetain((CFTypeRef)self);
 	audio_source_end((void *)self);
+	/*
+	 * The node's own "stopped" flag (_endOfDataMarkerSent, which its stop's block sets after ending the outputs -- run some 15 s
+	 * late on the node's queue here) set now: everything still queued for the node checks it first and does nothing. Without
+	 * it the silence path ran on a stopped node, read its _auOutputFormatDescription, already NULL, and died (SIGSEGV in a
+	 * CMAudioFormatDescriptionGetStreamBasicDescription caller, 14 s into a recording, step 86, 16 November). Nothing in
+	 * CMCapture ever clears the flag: a node stopped is not started again (a new graph makes new nodes).
+	 */
+	{
+		Ivar flag = class_getInstanceVariable(object_getClass(self), "_endOfDataMarkerSent");
+		static bool said;
+
+		if (flag != NULL) {
+			__atomic_store_n((uint8_t *)((uintptr_t)self + (uintptr_t)ivar_getOffset(flag)), 1, __ATOMIC_RELEASE);
+		}
+		if (!said) {
+			said = true;
+			say("hakios: mediaserverd: the audio source's _endOfDataMarkerSent set at its stop (%s)\n", flag != NULL ? "done" :
+			    "no such ivar: left alone");
+		}
+	}
 	return r;
 }
 
