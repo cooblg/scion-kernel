@@ -913,6 +913,36 @@ make_outputs_live(id self, SEL selector)
 	((void (*)(id, SEL))original_make_outputs_live)(self, selector);
 }
 
+/*
+ * Not enough, that (step 84, 15 November): a makeOutputsLiveIfNeeded queued BEFORE the stop still runs after it; its block
+ * (0x1a1efda18) finds the outputs audio_source_end has just ended -- liveFormat nil -- and calls -[BWNodeOutput
+ * makeConfiguredFormatLive] on each, which sends consumeMessage:fromOutput: to the freed node downstream (SIGABRT,
+ * "-[__NSCFType consumeMessage:fromOutput:]: unrecognized selector", 3 s after a recording's stop: mediaserverd died
+ * while the movie was still being written, and the file was left without its moov atom -- the gray, unplayable movie).
+ * So an output this file ended stays ended: its makeConfiguredFormatLive does nothing until its node is started again
+ * (audio_source_start takes its outputs out of ended_outputs).
+ */
+static IMP original_make_format_live;
+
+static void
+make_format_live(id self, SEL selector)
+{
+	bool ended = false;
+
+	pthread_mutex_lock(&ended_lock);
+	ended = ended_outputs != NULL && CFSetContainsValue(ended_outputs, (const void *)self);
+	pthread_mutex_unlock(&ended_lock);
+	if (ended) {
+		static int said;
+
+		if (said++ < 3) {
+			say("hakios: mediaserverd: an output we ended was to be made live again (a block queued before the stop): not done\n");
+		}
+		return;
+	}
+	((void (*)(id, SEL))original_make_format_live)(self, selector);
+}
+
 static void
 wrap_audio_source_stop(void)
 {
@@ -957,6 +987,20 @@ wrap_audio_source_stop(void)
 			say("hakios: mediaserverd: -[BWAudioSourceNode makeOutputsLiveIfNeeded] (%s) wrapped: nothing after a stop\n", types);
 		} else {
 			say("hakios: mediaserverd: -[BWAudioSourceNode makeOutputsLiveIfNeeded]: %s; left alone\n", lm ? types : "not there");
+		}
+	}
+	{
+		Class oc = objc_getClass("BWNodeOutput");
+		SEL f = sel_registerName("makeConfiguredFormatLive");
+		Method fm = oc != Nil ? class_getInstanceMethod(oc, f) : NULL;
+		const char *types = fm != NULL ? method_getTypeEncoding(fm) : NULL;
+
+		if (types != NULL && types[0] == 'v' && strspn(strchr(types, ':') + 1, "0123456789") == strlen(strchr(types, ':') + 1)) {
+			original_make_format_live = method_getImplementation(fm);
+			class_replaceMethod(oc, f, (IMP)make_format_live, types);
+			say("hakios: mediaserverd: -[BWNodeOutput makeConfiguredFormatLive] (%s) wrapped: an output we ended stays ended\n", types);
+		} else {
+			say("hakios: mediaserverd: -[BWNodeOutput makeConfiguredFormatLive]: %s; left alone\n", fm ? types : "not there");
 		}
 	}
 }
