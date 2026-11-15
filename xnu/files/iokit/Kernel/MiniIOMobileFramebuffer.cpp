@@ -2298,16 +2298,6 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	fStatWaiting += mach_absolute_time() - began;
-	/*
-	 * The panel asleep (the screen off: hakios.s6e3ha8.c): nothing reaches it and the DECON takes no flip. The frame is
-	 * taken as shown and not drawn -- not drawn into a scan-out buffer to wait on a flip that cannot come (scanLatch), and
-	 * not into the boot framebuffer as a fallback. The scan-out stays as it is for the wake.
-	 */
-	if (fGraphics && fScanMode > 0 && hakios_panel_asleep()) {
-		fSwapsShown++;
-		markShown(swapWord(swap, SWAP_ID));
-		return;
-	}
 	began = ready = mach_absolute_time();
 	if (gOnTheBeat) {
 		uint64_t period, aim, next;
