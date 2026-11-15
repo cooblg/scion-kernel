@@ -707,7 +707,7 @@ panel_display(int on)
 {
 	static const uint8_t key_on[] = { 0x9F, 0xA5, 0xA5 }, key_off[] = { 0x9F, 0x5A, 0x5A };
 	static const uint8_t display_off[] = { 0x28 }, display_on[] = { 0x29 };
-	bool ok;
+	bool ok, shown = false;
 
 	uint8_t before = 0xff, after = 0xff, mode_before = 0xff, mode_after = 0xff;
 	bool read_before, read_after;
@@ -728,7 +728,9 @@ panel_display(int on)
 		static const uint8_t sleep_out[] = { 0x11 };
 		bool dsc = panel_dsc();
 
-		ok = dsc && dsim_send(key_on, sizeof(key_on)) && dsim_send(sleep_out, 1);
+		/* (the sleep-out whatever became of the DSC packets: a panel left asleep is worse than one decoding badly) */
+		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(sleep_out, 1);
+		ok = dsc && ok;
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
 		lck_mtx_unlock(panel_lock);
 		delay(120 * 1000);              /* the sleep-out's own wait before the next command */
@@ -746,7 +748,8 @@ panel_display(int on)
 			lck_mtx_lock(panel_lock);
 		}
 		delay(20 * 1000);               /* a frame with the settings in before the output goes on */
-		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(display_on, 1) && ok;
+		shown = dsim_send(key_on, sizeof(key_on)) && dsim_send(display_on, 1);
+		ok = shown && ok;
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
 		panel_asleep = false;
 		say("s6e3ha8: woken: DSC and PPS %s; scaler, CASET/PASET 1440x2960, SET_AREA, TE on %s; the boot loader's registers %s; "
@@ -772,7 +775,12 @@ panel_display(int on)
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(on ? display_on : display_off, 1);
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
 	}
-	if (ok) {
+	/*
+	 * The state the touch screen's gate reads (hakios_panel_touch_blocked): on as soon as 29 went out, whatever else of
+	 * the wake did not -- one packet of the restore failing left it "off" and every touch was dropped until the next
+	 * screen-off (step 92: touch dead after a wake, the five-finger exit too).
+	 */
+	if (ok || (on && shown)) {
 		panel_display_state = on ? 1 : 0;
 	}
 	delay(30 * 1000);
