@@ -553,10 +553,40 @@ SYSCTL_PROC(_kern_hakios, OID_AUTO, brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFL
  */
 static int panel_display_state = -1;
 
-/* sleep-in with display-off: off by default (the panel woke with black bands: its settings are not kept); kern.hakios.panel_sleep=1 tries it */
-static int panel_sleep;
+/*
+ * Sleep-in with display-off, so that the screen is really off (28 alone left it faintly lit). The panel woke from it with
+ * black bands top and bottom and stuttered (15 November): it does not keep what the boot loader set up. Samsung's own init
+ * for this panel (drivers/video/fbdev/exynos/panel/s6e3ha8/s6e3ha8_crown_a3_s0_panel.h of the S9/Note9 kernel) sends, after
+ * the sleep-out: the scaler, CASET and PASET of the mode (the panel's default rows are 2560 -- PASET 0x9FF -- where the
+ * DECON sends 2960: the bands; and, the panel being in command mode, the rows outside the window it took kept their
+ * picture from before the sleep: the ghosting), SET_AREA, TE on (the frames are paced by TE: the stutter), then the brightness. Those are
+ * sent again here at every wake (panel_restore), for the mode the DECON drives, 1440x2960 (scaler off). On by default
+ * again; kern.hakios.panel_sleep=0 goes back to 28/29 alone.
+ */
+static int panel_sleep = 1;
 static bool panel_asleep;               /* put to sleep by panel_display(): the next on wakes it first */
 SYSCTL_INT(_kern_hakios, OID_AUTO, panel_sleep, CTLFLAG_RW | CTLFLAG_LOCKED, &panel_sleep, 0, "display-off also sleeps the panel");
+
+/* after a sleep-out, panel_lock held: what Samsung's init sets after its own sleep-out, for 1440x2960 */
+static bool
+panel_restore(void)
+{
+	static const uint8_t l1_on[] = { 0x9F, 0xA5, 0xA5 }, l1_off[] = { 0x9F, 0x5A, 0x5A };
+	static const uint8_t l2_on[] = { 0xF0, 0x5A, 0x5A }, l2_off[] = { 0xF0, 0xA5, 0xA5 };
+	static const uint8_t scaler[] = { 0xBA, 0x01, 0x26, 0x08, 0x08, 0xF3 };         /* 1440x2960: scaler off */
+	static const uint8_t caset[] = { 0x2A, 0x00, 0x00, 0x05, 0x9F };               /* columns 0..1439 */
+	static const uint8_t paset[] = { 0x2B, 0x00, 0x00, 0x0B, 0x8F };               /* rows 0..2959 */
+	static const uint8_t set_area[] = { 0x1A, 0x1F, 0x00, 0x00, 0x00, 0x00 };
+	static const uint8_t te_on[] = { 0x35, 0x00 };
+	bool ok;
+
+	ok = dsim_send(l2_on, sizeof(l2_on)) && dsim_send(scaler, sizeof(scaler));
+	ok = dsim_send(l2_off, sizeof(l2_off)) && ok;
+	ok = dsim_send(caset, sizeof(caset)) && dsim_send(paset, sizeof(paset)) && ok;
+	ok = dsim_send(l1_on, sizeof(l1_on)) && dsim_send(set_area, sizeof(set_area)) && dsim_send(te_on, sizeof(te_on)) && ok;
+	ok = dsim_send(l1_off, sizeof(l1_off)) && ok;
+	return ok;
+}
 
 static int
 panel_display(int on)
@@ -577,8 +607,8 @@ panel_display(int on)
 	read_before = panel_read(0x0A, &before, 1) && panel_read(0x0D, &mode_before, 1);
 	/*
 	 * Display-off alone (28) left the panel faintly lit (14-15 November: the screen grey-black, not off): its circuits
-	 * stay up. Off is now 28 then sleep-in (10), as Samsung's suspend sends them; on is sleep-out (11), its 120 ms, then
-	 * 29. The panel keeps its registers through a sleep (the brightness, TE), so nothing else is sent again.
+	 * stay up. Off is now 28 then sleep-in (10), as Samsung's suspend sends them; on is sleep-out (11), its 120 ms, what
+	 * the panel lost in the sleep (panel_restore: it does NOT keep its mode and TE, as was first assumed), then 29.
 	 */
 	if (on && panel_asleep) {
 		static const uint8_t sleep_out[] = { 0x11 };
@@ -588,9 +618,23 @@ panel_display(int on)
 		lck_mtx_unlock(panel_lock);
 		delay(120 * 1000);              /* the sleep-out's own wait before the next command */
 		lck_mtx_lock(panel_lock);
+		bool restored = panel_restore();
+
+		ok = restored && ok;
+		/* the brightness again (panel_set takes the lock itself) */
+		if (panel_level >= 0) {
+			int level = panel_level;
+
+			lck_mtx_unlock(panel_lock);
+			(void)panel_set(level);
+			lck_mtx_lock(panel_lock);
+		}
+		delay(20 * 1000);               /* a frame with the settings in before the output goes on */
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(display_on, 1) && ok;
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
 		panel_asleep = false;
+		say("s6e3ha8: woken: scaler, CASET/PASET 1440x2960, SET_AREA, TE on %s; brightness %d again\n",
+		    restored ? "sent" : "NOT ALL SENT", panel_level);
 	} else if (!on && panel_sleep) {
 		static const uint8_t sleep_in[] = { 0x10 };
 
