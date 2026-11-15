@@ -217,9 +217,9 @@ struct device {
 	UInt32 output_channels, input_channels;
 	/* its clock, running while anybody does I/O */
 	unsigned running;               /* how many clients have started I/O */
-	UInt64 anchor;                  /* mach_absolute_time() when the first of them did */
-	UInt64 periods;                 /* whole timestamp periods since */
 };
+
+static UInt64 clock_anchor;     /* every device's clock: mach_absolute_time() at the run's first I/O (get_zero_time_stamp) */
 
 static struct device devices[] = {
 	{ .object = OBJECT_SPEAKER, .uid = CFSTR("Speaker"), .output = OBJECT_SPEAKER_OUTPUT, .input = OBJECT_SPEAKER_INPUT,
@@ -948,8 +948,9 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 	}
 	pthread_mutex_lock(&lock);
 	if (d->running++ == 0) {
-		d->anchor = mach_absolute_time();
-		d->periods = 0;
+		if (clock_anchor == 0) {
+			clock_anchor = mach_absolute_time();
+		}
 		if (d->output != 0) {
 			written = refused = 0;
 			say("hakios: audio: playing\n");
@@ -983,7 +984,18 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 	return 0;
 }
 
-/* Where the device's clock was last at a multiple of TIMESTAMP_PERIOD frames, and when. */
+/*
+ * Where the device's clock was last at a multiple of TIMESTAMP_PERIOD frames, and when.
+ *
+ * One clock for every device, started at the first I/O of the run and never restarted. Each device had its own, restarted
+ * at sample time 0 whenever its first client started: the camera records through an aggregate of the microphone and the
+ * speaker, and when the recording's start sound played (the speaker's I/O starting from nobody) the speaker's clock went
+ * back to 0 under the running microphone -- every audio buffer of the recording after it had a presentation time some
+ * 10 000 s before the host clock's, running ever faster to catch up (step 87, 16 November: "lag: audio buffer 101: pts
+ * -10014 s"; video 0.03 s), and the movie's writer could not put the two together (the moov never written). All of them
+ * play by mach_absolute_time() anyway: one timeline is the truth for all.
+ */
+
 static OSStatus
 get_zero_time_stamp(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unused UInt32 client,
     Float64 *sample_time, UInt64 *host_time, UInt64 *seed)
@@ -996,11 +1008,13 @@ get_zero_time_stamp(__unused AudioServerPlugInDriverRef driver, AudioObjectID ob
 		return kAudioHardwareBadObjectError;
 	}
 	pthread_mutex_lock(&lock);
-	while (now >= d->anchor + (UInt64)((Float64)(d->periods + 1) * ticks_per_period)) {
-		d->periods++;
+	if (clock_anchor == 0) {
+		clock_anchor = now;
 	}
-	*sample_time = (Float64)d->periods * TIMESTAMP_PERIOD;
-	*host_time = d->anchor + (UInt64)((Float64)d->periods * ticks_per_period);
+	UInt64 periods = now > clock_anchor ? (UInt64)((Float64)(now - clock_anchor) / ticks_per_period) : 0;
+
+	*sample_time = (Float64)periods * TIMESTAMP_PERIOD;
+	*host_time = clock_anchor + (UInt64)((Float64)periods * ticks_per_period);
 	*seed = 1;
 	pthread_mutex_unlock(&lock);
 	return 0;
