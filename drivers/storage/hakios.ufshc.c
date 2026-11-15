@@ -387,10 +387,13 @@ static const struct ufshc_soc hc_socs[] = {
 	{
 		.name = "exynos9810", .pa = 0x11120000, .size = 0x200, .vs_pa = 0x11121100, .vs_size = 0x200,
 		.prdt_bytes = true, .prd_entry = 128, .prd_max = 4096, .rsp_offset = 1024, .rsp_length = 1024,
-		.prdt_offset = 2048, .clear_with_ones = true, .dma32 = true, .slot_buffer = 64u << 10,
+		.prdt_offset = 2048, .clear_with_ones = true, .dma32 = true, .slot_buffer = 256u << 10,
 		.default_step = 1, .dma_lo = 0x80000000ULL, .dma_hi = 0x100000000ULL,
 		.carve_pa = UFSHC_S9_MEM_PA, .carve_size = UFSHC_S9_MEM_BYTES,
 		/*
+		 * 256 KB a request (64 PRDT entries of 4 KB, the most hc_place builds; it was 64 KB): with one request at a
+		 * time, a movie's writes went out a quarter as big as they could (15 November: 0.9 MB/s into the file while
+		 * the device was busy 8.5 s of 74). ufs_native_buffer=65536 puts the old size back.
 		 * One request at a time, as Silicium's UfsDxe does (ufs-ro4 on the phone: 57 reads, two in flight at
 		 * once, then slot 4's 64 KB read never cleared its doorbell bit, with IS's UTRCS set and its bit in
 		 * 0x64 (UTRLCNR, which this 2.1 controller has: it read 00000014) set). UTRLCNR cleared per slot.
@@ -519,7 +522,7 @@ SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_native_write_bytes, CTLFLAG_RD | CTLFLAG
  */
 extern void loader_log_line(const char *line);
 #define KEPT_LINES          64
-#define LINE                320
+#define LINE                448
 static char hc_kept[KEPT_LINES][LINE];
 static uint32_t hc_kept_count;
 
@@ -1399,7 +1402,7 @@ hc_off(void)
  * (written with ones), the UTRLCNR bit written, and, if the doorbell bit is still set, that slot cleared with
  * UTRLCLR (clear_with_ones: on the Exynos a one clears, as the safety net did in rw7 and rw8; UFSHCI's own
  * sense is a zero) and the bit confirmed clear. A waiter spins (hc_spin_us, 2 ms: a 4 KB read is done in well under that) and then sleeps
- * in 1 ms steps; no poller thread, no 100 ms tick.
+ * in 100 us steps; no poller thread, no 100 ms tick.
  */
 static void hc_stuck(struct hc_slot *s);
 static uint32_t hc_spin_us = 2000;              /* boot-arg ufs_native_spin */
@@ -1579,7 +1582,11 @@ hc_wait(struct hc_slot *s, const char *what, bool count)
 			slept = true;
 			os_atomic_inc(&hc_sleeps, relaxed);
 		}
-		IOSleep(1);
+		/*
+		 * 100 us steps, not IOSleep(1)'s millisecond and more: a 256 KB write is done in one or two milliseconds, and
+		 * each request waited the step out, one request at a time.
+		 */
+		delay_for_interval_with_leeway(100, 25, NSEC_PER_USEC);
 		polls++;
 	}
 	s->done_at = mach_absolute_time();
@@ -1620,7 +1627,7 @@ hc_wait(struct hc_slot *s, const char *what, bool count)
  */
 #define HC_WIN 32
 static struct {
-	uint64_t sec, rd, wr;
+	uint64_t sec, rd, wr, nwr, wr_us, busy_us;     /* bytes read, written; writes, their doorbell-to-done, every request's */
 } hc_win[HC_WIN];
 static uint64_t hc_lat_n, hc_lat_sum_us, hc_lat_max_us, hc_lat4k_n, hc_lat4k_sum_us, hc_lat4k_max_us;
 
@@ -1645,9 +1652,15 @@ hc_speed_add(struct hc_slot *s, bool write, uint64_t bytes)
 		hc_win[sec % HC_WIN].sec = sec;
 		hc_win[sec % HC_WIN].rd = 0;
 		hc_win[sec % HC_WIN].wr = 0;
+		hc_win[sec % HC_WIN].nwr = 0;
+		hc_win[sec % HC_WIN].wr_us = 0;
+		hc_win[sec % HC_WIN].busy_us = 0;
 	}
+	hc_win[sec % HC_WIN].busy_us += us;
 	if (write) {
 		hc_win[sec % HC_WIN].wr += bytes;
+		hc_win[sec % HC_WIN].nwr++;
+		hc_win[sec % HC_WIN].wr_us += us;
 	} else {
 		hc_win[sec % HC_WIN].rd += bytes;
 	}
@@ -1673,12 +1686,16 @@ hc_speed_add(struct hc_slot *s, bool write, uint64_t bytes)
 static void
 hc_speed_line(char *buf, size_t size)
 {
-	uint64_t now = hc_now_s(), rd = 0, wr = 0, n, sum, max, n4, sum4, max4, rkb, wkb;
+	uint64_t now = hc_now_s(), rd = 0, wr = 0, nwr = 0, wr_us = 0, busy = 0, n, sum, max, n4, sum4, max4, rkb, wkb;
+	size_t at;
 
 	for (uint32_t i = 0; i < HC_WIN; i++) {
 		if (hc_win[i].sec + 30 > now && hc_win[i].sec <= now) {
 			rd += hc_win[i].rd;
 			wr += hc_win[i].wr;
+			nwr += hc_win[i].nwr;
+			wr_us += hc_win[i].wr_us;
+			busy += hc_win[i].busy_us;
 		}
 	}
 	n = hc_lat_n;
@@ -1693,6 +1710,12 @@ hc_speed_line(char *buf, size_t size)
 	    "(%llu MB); doorbell to done: %llu requests, average %llu us, at most %llu us; 4 KB reads: %llu, average %llu "
 	    "us, at most %llu us\n", rkb / 1000, rkb % 1000 / 100, rd >> 20, wkb / 1000, wkb % 1000 / 100, wr >> 20, n,
 	    n ? sum / n : 0, max, n4, n4 ? sum4 / n4 : 0, max4);
+	/* the same 30 s: the writes (how many, how big, how long each), and how much of the time a request was in flight */
+	at = strlen(buf);
+	if (at > 0 && at < size && buf[at - 1] == '\n') {
+		snprintf(buf + at - 1, size - at + 1, "; writes %llu, %llu KB each, %llu us each; the device busy %llu%%\n", nwr,
+		    nwr ? wr / nwr / 1024 : 0, nwr ? wr_us / nwr : 0, busy / 300000);
+	}
 }
 
 /* A slot whose doorbell bit did not clear: everything that tells what the controller made of it */
@@ -2649,14 +2672,14 @@ hc_report(const char *when, bool late)
 		    "3-4 %llu, 5-8 %llu, 9-16 %llu, more %llu\n", when, hc_polls, hc_requests ? hc_polls / hc_requests : 0,
 		    hc_slot_waits, wait_ns / 1000000, lock_ns / 1000000, hc_flight_hist[0], hc_flight_hist[1],
 		    hc_flight_hist[2], hc_flight_hist[3], hc_flight_hist[4], hc_flight_hist[5]);
-		(late ? hc_say_late : hc_say)("ufs: native: %s: waiters spin %u us, then sleep in 1 ms steps: %llu slept\n",
+		(late ? hc_say_late : hc_say)("ufs: native: %s: waiters spin %u us, then sleep in 100 us steps: %llu slept\n",
 		    when, hc_spin_us, hc_sleeps);
 		(late ? hc_say_late : hc_say)("ufs: native: %s: completion: done by the doorbell bit %llu, by UTRLCNR %llu "
 		    "(%s), by the descriptor and response %llu; doorbell bits cleared with UTRLCLR %llu; not finished at once "
 		    "%llu\n", when, hc_done_by[HC_BY_DB], hc_done_by[HC_BY_CNR], hc_cnr_broken ? "NOT USED: a bit did not clear" :
 		    hc_cnr_on() ? "used" : "not used", hc_done_by[HC_BY_OCS], hc_cleared, hc_finish_failed);
 		{
-			char line[320];
+			char line[448];
 
 			hc_speed_line(line, sizeof(line));
 			(late ? hc_say_late : hc_say)("%s", line);
