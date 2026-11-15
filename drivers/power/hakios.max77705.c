@@ -824,8 +824,8 @@ haptic_start(void)
  * should the chip lose them (its watchdog, a replug): the input's limit, CNFG_09 [6:0] (mA / 25 - 1), and the fast-charge
  * current, CNFG_02 [5:0] (mA / 50), behind CHGPROT, CNFG_06 [3:2] = 3; and, when the watchdog is on (CNFG_00 bit 4),
  * its clear, CNFG_06 [1:0] = 1, at every poll. The float voltage (CNFG_04) and the mode are never touched.
- * Values: a wall charger or a charging host (BC_STATUS [1:0] 3 or 2) 1500 mA in, 1500 mA into the battery (about 7.5 W:
- * under Samsung's own 5 V figures for this phone, and 0.375 C of the Note9's 4000 mAh); a plain USB host (1), or no type
+ * Values: a wall charger or a charging host (BC_STATUS [1:0] 3 or 2) 2000 mA in, 2000 mA into the battery (10 W at 5 V,
+ * 0.5 C of the Note9's 4000 mAh; 9 V adaptive charging, for 15 W, is not negotiated here); a plain USB host (1), or no type
  * yet: left as it is. The battery under 0 or over 45 C: 500 mA into it.
  * Facts from Samsung's drivers/battery_v2/max77705_charger.c and include/linux/mfd/max77705-private.h of the S9's kernel
  * (LineageOS android_kernel_samsung_exynos9810): read for the registers and formulas, not copied.
@@ -834,8 +834,8 @@ haptic_start(void)
 #define CHG_CNFG_02     0xB9
 #define CHG_CNFG_06     0xBD
 #define CHG_CNFG_09     0xC0
-#define CHG_IN_MA       1500
-#define CHG_CC_MA       1500
+#define CHG_IN_MA       2000
+#define CHG_CC_MA       2000
 #define CHG_CC_TEMP_MA  500
 
 static bool chg_enabled = true;
