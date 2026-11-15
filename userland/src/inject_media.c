@@ -78,6 +78,8 @@ static uintptr_t slide;
 static id send0(id o, const char *sel);
 static CFMutableSetRef ended_outputs;           /* outputs we marked ended: their later buffers are dropped */
 static pthread_mutex_t ended_lock = PTHREAD_MUTEX_INITIALIZER;
+static CFMutableDictionaryRef ends_owed;        /* output -> how many of the node's own (late) ends to swallow (end_live_output) */
+static __thread bool ending_here;               /* audio_source_end's own markEndOfLiveOutput */
 static CFMutableSetRef stopped_sources;         /* audio source nodes stopped and not started again (under ended_lock) */
 
 /* +[BWCoreImageFilterRenderer prewarmPortraitFilterVersion:semanticStyleFilters:] */
@@ -828,8 +830,15 @@ audio_source_end(void *context)
 				ended_outputs = CFSetCreateMutable(NULL, 0, &kept);
 			}
 			CFSetAddValue(ended_outputs, (const void *)out);
+			if (ends_owed == NULL) {
+				ends_owed = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, NULL);
+			}
+			CFDictionarySetValue(ends_owed, (const void *)out,
+			    (const void *)((uintptr_t)CFDictionaryGetValue(ends_owed, (const void *)out) + 1));
 			pthread_mutex_unlock(&ended_lock);
+			ending_here = true;
 			((void (*)(id, SEL))objc_msgSend)(out, sel_registerName("markEndOfLiveOutput"));
+			ending_here = false;
 			ended++;
 		}
 	}
@@ -922,6 +931,47 @@ make_outputs_live(id self, SEL selector)
  * So an output this file ended stays ended: its makeConfiguredFormatLive does nothing until its node is started again
  * (audio_source_start takes its outputs out of ended_outputs).
  */
+/*
+ * And the node ends its outputs itself, after all: -[BWAudioSourceNode stop:] dispatches a block (0x1a1f51d38) that calls
+ * markEndOfLiveOutput on each of them -- on the node's queue, which ran it some 15 s after the stop here (step 85, 15
+ * November): the photo session's audio node, stopped when the camera switched to video, ended its outputs in the middle
+ * of the recording, a second time (audio_source_end had ended them at the stop), and the end-of-data message went to
+ * the freed node downstream (SIGSEGV in -[BWNodeOutput markEndOfLiveOutput]; the recording "stopped by itself" at 9 s,
+ * the movie unfinished). So for every end audio_source_end made first, the node's own later end of that output is
+ * swallowed, once; an end of an output we did not end goes through.
+ */
+static IMP original_end_live_output;
+
+static void
+end_live_output(id self, SEL selector)
+{
+	bool swallow = false;
+
+	if (!ending_here) {
+		pthread_mutex_lock(&ended_lock);
+		uintptr_t owed = ends_owed != NULL ? (uintptr_t)CFDictionaryGetValue(ends_owed, (const void *)self) : 0;
+
+		if (owed != 0) {
+			swallow = true;
+			if (owed == 1) {
+				CFDictionaryRemoveValue(ends_owed, (const void *)self);
+			} else {
+				CFDictionarySetValue(ends_owed, (const void *)self, (const void *)(owed - 1));
+			}
+		}
+		pthread_mutex_unlock(&ended_lock);
+	}
+	if (swallow) {
+		static int said;
+
+		if (said++ < 5) {
+			say("hakios: mediaserverd: the audio source's own late end of an output we had ended: swallowed\n");
+		}
+		return;
+	}
+	((void (*)(id, SEL))original_end_live_output)(self, selector);
+}
+
 static IMP original_make_format_live;
 
 static void
@@ -1001,6 +1051,18 @@ wrap_audio_source_stop(void)
 			say("hakios: mediaserverd: -[BWNodeOutput makeConfiguredFormatLive] (%s) wrapped: an output we ended stays ended\n", types);
 		} else {
 			say("hakios: mediaserverd: -[BWNodeOutput makeConfiguredFormatLive]: %s; left alone\n", fm ? types : "not there");
+		}
+		SEL m = sel_registerName("markEndOfLiveOutput");
+		Method mm = oc != Nil ? class_getInstanceMethod(oc, m) : NULL;
+		const char *mt = mm != NULL ? method_getTypeEncoding(mm) : NULL;
+
+		if (mt != NULL && mt[0] == 'v' && strspn(strchr(mt, ':') + 1, "0123456789") == strlen(strchr(mt, ':') + 1)) {
+			original_end_live_output = method_getImplementation(mm);
+			class_replaceMethod(oc, m, (IMP)end_live_output, mt);
+			say("hakios: mediaserverd: -[BWNodeOutput markEndOfLiveOutput] (%s) wrapped: the node's own late end swallowed "
+			    "where we ended first\n", mt);
+		} else {
+			say("hakios: mediaserverd: -[BWNodeOutput markEndOfLiveOutput]: %s; left alone\n", mm ? mt : "not there");
 		}
 	}
 }
