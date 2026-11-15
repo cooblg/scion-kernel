@@ -264,13 +264,14 @@ static bool
 open_encoder(struct enc_session *e)
 {
 	/*
-	 * The bit rate capped: CMCapture asks 15.3 Mb/s for 1080p30 (1.9 MB/s), and the storage here took the movie at about
-	 * 0.9 MB/s while recording (UFS, one request at a time; 15 November): the movie's writer fell 8 MB behind, and the stop
-	 * could not finish it. 8 Mb/s for 1080p (1 MB/s), 5 for 720p and below, 20 for 4K.
+	 * The bit rate as asked (CMCapture: 15.3 Mb/s for 1080p30), up to 20 Mb/s, 40 for 4K. (Step 84 capped it at 8 Mb/s on the
+	 * guess that the storage could not keep up; step 85 measured the storage busy 1% while recording: the guess was wrong.)
 	 */
-	uint32_t cap = e->width * e->height > 1920 * 1088 ? 20000000u : e->width * e->height > 1280 * 720 ? 8000000u : 5000000u;
+	uint32_t cap = e->width * e->height > 1920 * 1088 ? 40000000u : 20000000u;
 
-	if (e->bitrate == 0 || e->bitrate > cap) {
+	if (e->bitrate == 0) {
+		e->bitrate = e->width * e->height > 1280 * 720 ? 15000000u : 8000000u;
+	} else if (e->bitrate > cap) {
 		e->bitrate = cap;
 	}
 	uint8_t header[HEADER_ROOM];

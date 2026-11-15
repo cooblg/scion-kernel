@@ -476,6 +476,19 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 						silence = *(long long *)((uintptr_t)node + (uintptr_t)ivar_getOffset(sv));
 					}
 				}
+				/* the node's own clock (an audio device's?), where it is now against the host clock */
+				double clock_now = -1;
+
+				if (node != nil && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(node, sel_registerName("respondsToSelector:"),
+				    sel_registerName("clock"))) {
+					CMClockRef clock = (CMClockRef)send0(node, "clock");
+
+					if (clock != NULL) {
+						clock_now = CMTimeGetSeconds(CMClockGetTime(clock));
+					}
+				}
+				say("hakios: mediaserverd: lag: that audio buffer: node %p, its clock at %.3f s (host %.3f s)\n", (void *)node,
+				    clock_now, now);
 				say("hakios: mediaserverd: lag: that audio buffer: %ld frames, %.4f s long, %.0f Hz %u ch (format '%c%c%c%c'), "
 				    "node %s, silence frames since the last render %lld\n", (long)CMSampleBufferGetNumSamples(sample_buffer),
 				    CMTimeGetSeconds(CMSampleBufferGetDuration(sample_buffer)), asbd ? asbd->mSampleRate : 0.0,
@@ -1055,6 +1068,23 @@ make_format_live(id self, SEL selector)
 	((void (*)(id, SEL))original_make_format_live)(self, selector);
 }
 
+/* the audio source's interruptions, said (the record sound may interrupt the capture's audio: hypothesis, step 89) */
+static IMP original_begin_interruption, original_set_interrupted;
+
+static void
+begin_interruption(id self, SEL selector)
+{
+	say("hakios: mediaserverd: the audio source %p: didBeginInterruption\n", (void *)self);
+	((void (*)(id, SEL))original_begin_interruption)(self, selector);
+}
+
+static void
+set_interrupted(id self, SEL selector, BOOL value)
+{
+	say("hakios: mediaserverd: the audio source %p: setInterrupted:%d\n", (void *)self, value);
+	((void (*)(id, SEL, BOOL))original_set_interrupted)(self, selector, value);
+}
+
 static void
 wrap_audio_source_stop(void)
 {
@@ -1100,6 +1130,21 @@ wrap_audio_source_stop(void)
 		} else {
 			say("hakios: mediaserverd: -[BWAudioSourceNode makeOutputsLiveIfNeeded]: %s; left alone\n", lm ? types : "not there");
 		}
+	}
+	{
+		Method bm = class_getInstanceMethod(cls, sel_registerName("didBeginInterruption"));
+		Method im = class_getInstanceMethod(cls, sel_registerName("setInterrupted:"));
+
+		if (bm != NULL && strcmp(method_getTypeEncoding(bm), "v16@0:8") == 0) {
+			original_begin_interruption = method_getImplementation(bm);
+			class_replaceMethod(cls, sel_registerName("didBeginInterruption"), (IMP)begin_interruption, "v16@0:8");
+		}
+		if (im != NULL && strcmp(method_getTypeEncoding(im), "v20@0:8B16") == 0) {
+			original_set_interrupted = method_getImplementation(im);
+			class_replaceMethod(cls, sel_registerName("setInterrupted:"), (IMP)set_interrupted, "v20@0:8B16");
+		}
+		say("hakios: mediaserverd: the audio source's interruptions said (didBeginInterruption %s, setInterrupted: %s)\n",
+		    bm ? method_getTypeEncoding(bm) : "none", im ? method_getTypeEncoding(im) : "none");
 	}
 	{
 		Class oc = objc_getClass("BWNodeOutput");
