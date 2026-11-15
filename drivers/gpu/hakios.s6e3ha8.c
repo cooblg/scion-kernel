@@ -564,7 +564,21 @@ static int panel_display_state = -1;
  * again; kern.hakios.panel_sleep=0 goes back to 28/29 alone.
  */
 static int panel_sleep = 1;
-static bool panel_asleep;               /* put to sleep by panel_display(): the next on wakes it first */
+static volatile bool panel_asleep;      /* put to sleep by panel_display(): the next on wakes it first */
+
+/*
+ * Whether the panel is asleep -- from the sleep-in until its display-on after the wake. While it is, it sends no TE, so the
+ * DECON takes no flip: MiniIOMobileFramebuffer's scanLatch must not take that for a broken scan-out. It did (step 89, 16
+ * November: "a flip not taken in 100 ms" at the first blank after boot), gave the scaler path up for good and drew every
+ * frame into the boot framebuffer by the processor from then on -- the ghosting and the stutter seen after every screen-off.
+ */
+bool hakios_panel_asleep(void);
+
+bool
+hakios_panel_asleep(void)
+{
+	return panel_asleep;
+}
 SYSCTL_INT(_kern_hakios, OID_AUTO, panel_sleep, CTLFLAG_RW | CTLFLAG_LOCKED, &panel_sleep, 0, "display-off also sleeps the panel");
 
 /* after a sleep-out, panel_lock held: what Samsung's init sets after its own sleep-out, for 1440x2960 */

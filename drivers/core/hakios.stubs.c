@@ -210,6 +210,7 @@ void hakios_max98512_quiesce(void) {}
 void hakios_s6e3ha8_init(void) {}
 bool hakios_s6e3ha8_blank(__unused int (*say)(const char *, ...)) { return false; }      /* "not blanked" */
 bool hakios_panel_touch_blocked(__unused uint32_t type, __unused uint32_t finger) { return false; }
+bool hakios_panel_asleep(void) { return false; }    /* no panel driver: never asleep */
 #endif
 
 #ifndef HAKIOS_W9018

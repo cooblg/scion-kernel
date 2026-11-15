@@ -381,6 +381,7 @@ int hakios_scanout_show(uint64_t phys, uint32_t rowbytes);
 int hakios_mali_second(uint64_t * busy_ns, uint32_t * jobs, uint64_t * queued_ns, uint32_t * mhz, uint32_t * switches,
     int32_t * g3d_mc);
 int hakios_scanout_latched(void);
+bool hakios_panel_asleep(void);
 void hakios_scanout_detach(const char * why);
 uint32_t hakios_scanout_refreshes(void);
 void loader_log_line(const char * line);
@@ -1895,6 +1896,14 @@ IOMobileFramebuffer::scanLatch(void)
 		return true;
 	}
 	for (unsigned ms = 0; !hakios_scanout_latched(); ms++) {
+		/*
+		 * The panel asleep (hakios.s6e3ha8.c: screen off, or its wake not finished) sends no TE and the DECON takes no
+		 * flip: not a broken scan-out. This frame is skipped, the flip stays asked for, and the DECON takes it at the
+		 * first TE after the wake. (It was given up here for good at every screen-off: step 89.)
+		 */
+		if (hakios_panel_asleep()) {
+			return false;
+		}
 		if (ms >= FLIP_STUCK_MS) {
 			scanDrop("a flip not taken in 100 ms");
 			return false;
@@ -2281,6 +2290,16 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	bool inPlace;                           /* (fb_zc: the surface scanned out as it is: drawLayer() draws nothing) */
 	bool report;
 
+	/*
+	 * The panel asleep (the screen off: hakios.s6e3ha8.c): nothing reaches it and the DECON takes no flip. The frame is
+	 * taken as shown and not drawn -- not drawn into a scan-out buffer to wait on a flip that cannot come (scanLatch), and
+	 * not into the boot framebuffer as a fallback. The scan-out stays as it is for the wake.
+	 */
+	if (fGraphics && fScanMode > 0 && hakios_panel_asleep()) {
+		fSwapsShown++;
+		markShown(swapWord(swap, SWAP_ID));
+		return;
+	}
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
 			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
