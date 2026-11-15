@@ -443,6 +443,28 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 		}
 	}
 	time_photo_encoder(self, sample_buffer);
+	/*
+	 * How far behind real time the buffers go out: the host clock now less the buffer's presentation time, every 100th
+	 * audio buffer and every 150th video one (the audio source's queue ran ~15 s late in step 85/86: is its audio late too?)
+	 */
+	{
+		CMFormatDescriptionRef f = CMSampleBufferGetFormatDescription(sample_buffer);
+		CMMediaType type = f != NULL ? CMFormatDescriptionGetMediaType(f) : 0;
+		static unsigned audio_n, video_n;
+		unsigned n = type == kCMMediaType_Audio ? ++audio_n : type == kCMMediaType_Video ? ++video_n : 0;
+
+		if ((type == kCMMediaType_Audio && n % 100 == 1) || (type == kCMMediaType_Video && n % 150 == 1)) {
+			CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample_buffer);
+			double now = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()));
+			id node = send0(self, "node");
+			id name = node != nil ? send0(node, "name") : nil;
+
+			say("hakios: mediaserverd: lag: %s buffer %u from %s: pts %.3f s, %.3f s behind the host clock\n",
+			    type == kCMMediaType_Audio ? "audio" : "video", n, name != nil ?
+			    ((const char *(*)(id, SEL))objc_msgSend)(name, sel_registerName("UTF8String")) : "?",
+			    CMTimeGetSeconds(pts), now - CMTimeGetSeconds(pts));
+		}
+	}
 	((void (*)(id, SEL, CMSampleBufferRef))original_emit_sample_buffer)(self, selector, sample_buffer);
 }
 
