@@ -489,6 +489,25 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 				}
 				say("hakios: mediaserverd: lag: that audio buffer: node %p, its clock at %.3f s (host %.3f s)\n", (void *)node,
 				    clock_now, now);
+				/*
+				 * The audio source's buffers going out ever later (step 91: 2.1 s more every 10 buffers of 21 ms -- each one
+				 * some 200 ms late): every thread of this process printed by the kernel (kern.hakios.ustacks), twice, at
+				 * 1 s and at 5 s behind, to see what the audio's queue waits on.
+				 */
+				{
+					static int dumps;
+					double behind = now - CMTimeGetSeconds(pts);
+					Class asn2 = objc_getClass("BWAudioSourceNode");
+
+					if (node != nil && asn2 != Nil && ((BOOL (*)(id, SEL, Class))objc_msgSend)(node,
+					    sel_registerName("isKindOfClass:"), asn2) && behind < 100 &&
+					    ((dumps == 0 && behind > 1.0) || (dumps == 1 && behind > 5.0))) {
+						dumps++;
+						say("hakios: mediaserverd: lag: audio %.1f s behind: every thread of mediaserverd asked for (ustacks %d)\n",
+						    behind, dumps);
+						sysctlbyname("kern.hakios.ustacks", NULL, NULL, (void *)"mediaserverd", sizeof("mediaserverd"));
+					}
+				}
 				say("hakios: mediaserverd: lag: that audio buffer: %ld frames, %.4f s long, %.0f Hz %u ch (format '%c%c%c%c'), "
 				    "node %s, silence frames since the last render %lld\n", (long)CMSampleBufferGetNumSamples(sample_buffer),
 				    CMTimeGetSeconds(CMSampleBufferGetDuration(sample_buffer)), asbd ? asbd->mSampleRate : 0.0,
