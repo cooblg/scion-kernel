@@ -326,6 +326,22 @@ encode(struct enc_session *e, CVImageBufferRef image, CMTime pts, CMTime duratio
 	f.key = e->frames == 0 || (options != NULL && CFDictionaryGetValue(options, kVTEncodeFrameOptionKey_ForceKeyFrame) == kCFBooleanTrue);
 	f.stream = (uint64_t)(uintptr_t)e->stream;
 	f.stream_room = STREAM_ROOM;
+
+	/* what the picture holds, sampled (64 points of its luma, 64 of its chroma): to tell a real picture from a blank one in the log */
+	unsigned y_mean = 0, uv_mean = 0;
+	{
+		size_t w = CVPixelBufferGetWidthOfPlane(image, 0), h = CVPixelBufferGetHeightOfPlane(image, 0);
+		const uint8_t *yp = (const uint8_t *)(uintptr_t)f.y, *cp = (const uint8_t *)(uintptr_t)f.uv;
+
+		for (unsigned k = 0; k < 64 && yp != NULL && cp != NULL; k++) {
+			size_t x = (w * (2 * (k % 8) + 1)) / 16, yy = (h * (2 * (k / 8) + 1)) / 16;
+
+			y_mean += yp[yy * f.y_stride + x];
+			uv_mean += cp[(yy / 2) * f.uv_stride + (x & ~(size_t)1)];
+		}
+		y_mean /= 64;
+		uv_mean /= 64;
+	}
 	int r = ioctl(e->fd, HAKIOS_MFC_ENC_FRAME, &f);
 	int error = errno;
 
@@ -374,9 +390,9 @@ encode(struct enc_session *e, CVImageBufferRef image, CMTime pts, CMTime duratio
 	e->frames++;
 	e->bytes += n;
 	e->us += f.us;
-	if (e->frames <= 2) {
-		say("session %p: picture %llu: %zu bytes%s, %u us in the block", (void *)e->session, (unsigned long long)e->frames, n,
-		    f.key ? " (key)" : "", f.us);
+	if (e->frames <= 3 || e->frames % 30 == 0) {
+		say("session %p: picture %llu: %zu bytes%s, %u us in the block; pts %.3f s; luma mean %u, Cb mean %u (sampled)", (void *)e->session,
+		    (unsigned long long)e->frames, n, f.key ? " (key)" : "", f.us, CMTimeGetSeconds(pts), y_mean, uv_mean);
 	}
 	*status = noErr;
 	return sample;
@@ -393,6 +409,7 @@ invalidate(void *base)
 		e->inner_vt->base->invalidate(VTVideoEncoderGetCMBaseObject_(e->inner));
 	}
 	if (e->fd >= 0) {
+		say("session %p: invalidated after %llu pictures", e->session, (unsigned long long)e->frames);
 		close(e->fd);
 		e->fd = -1;
 	}
@@ -552,11 +569,17 @@ encode_frame(void *encoder, void *token, CVImageBufferRef image, const CMTime *p
 	}
 	CMSampleBufferRef sample = encode(e, image, *pts, *duration, properties, &status);
 
+	OSStatus emitted;
+
 	if (sample != NULL) {
-		VTEncoderSessionEmitEncodedFrame_(e->session, token, noErr, 0, sample);
+		emitted = VTEncoderSessionEmitEncodedFrame_(e->session, token, noErr, 0, sample);
 		CFRelease(sample);
 	} else {
-		VTEncoderSessionEmitEncodedFrame_(e->session, token, status, status == noErr ? INFO_FRAME_DROPPED : 0, NULL);
+		emitted = VTEncoderSessionEmitEncodedFrame_(e->session, token, status, status == noErr ? INFO_FRAME_DROPPED : 0, NULL);
+		say("session %p: picture %llu: none emitted (%d)", e->session, (unsigned long long)e->frames, (int)status);
+	}
+	if (emitted != noErr || e->frames <= 1) {
+		say("session %p: picture %llu given to VideoToolbox: %d", e->session, (unsigned long long)e->frames, (int)emitted);
 	}
 	return noErr;
 }
@@ -569,6 +592,8 @@ complete_frames(void *encoder, const CMTime *until)
 	if (e->inner != NULL && e->inner_vt->derived->complete != NULL) {
 		return e->inner_vt->derived->complete(e->inner, until);
 	}
+	say("session %p: complete the frames until %.3f s (%llu pictures so far; every one already emitted)", e->session,
+	    until != NULL ? CMTimeGetSeconds(*until) : -1.0, (unsigned long long)e->frames);
 	return noErr;           /* (every picture has been emitted already) */
 }
 
