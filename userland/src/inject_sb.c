@@ -758,6 +758,25 @@ bt_watch(int round)
 	}
 	if (round == 0 || round % 10 == 0 || strcmp(line, last) != 0) {
 		say("hakios: bluetooth: BluetoothManager in SpringBoard: %s\n", line);
+		/*
+		 * Control Center's Bluetooth button stayed grey for a whole run (step 95) while BluetoothManager here said available:
+		 * it asked at boot, when BluetoothManager was not available yet (available 0 for the first seconds), and was not told
+		 * of the change; it came alive in step 91 only after a switch in Settings. When it becomes available, its own
+		 * notifications are posted again (what its observers are told on a real change).
+		 */
+		if (m != nil && strncmp(line, "available 1", 11) == 0 && strncmp(last, "available 1", 11) != 0) {
+			Class nc = objc_getClass("NSNotificationCenter");
+			id center = nc != Nil ? ((id (*)(Class, SEL))objc_msgSend)(nc, sel_registerName("defaultCenter")) : nil;
+			SEL post = sel_registerName("postNotificationName:object:");
+
+			if (center != nil) {
+				((void (*)(id, SEL, id, id))objc_msgSend)(center, post, (id)CFSTR("BluetoothAvailabilityChangedNotification"), m);
+				((void (*)(id, SEL, id, id))objc_msgSend)(center, post, (id)CFSTR("BluetoothPowerChangedNotification"), m);
+				((void (*)(id, SEL, id, id))objc_msgSend)(center, post, (id)CFSTR("BluetoothStateChangedNotification"), m);
+				say("hakios: bluetooth: BluetoothManager available now: its availability, power and state notifications posted "
+				    "again for Control Center\n");
+			}
+		}
 		strlcpy(last, line, sizeof(last));
 	}
 	if (round < 100) {
