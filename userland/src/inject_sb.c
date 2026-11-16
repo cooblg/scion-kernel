@@ -731,9 +731,60 @@ battery_post_notifications(void)
  * switches it. Control Center's module asks BluetoothManager (BluetoothManager.framework), so what that says is logged: at
  * 20 s, then every 30 s for five minutes, and whenever it changes -- available, enabled, powered, and its state number.
  */
+/*
+ * Control Center's Bluetooth button, from the inside (it stayed grey in step 96 while BluetoothManager here said state 3,
+ * which its -_enabledForState: takes for enabled): what state it is given (-_updateWithState:) and whether a tap reaches
+ * it (-_toggleState). Hooked once its bundle (ConnectivityModule) is loaded, from bt_watch.
+ */
+static IMP original_cc_bt_update, original_cc_bt_toggle;
+
+static void
+cc_bt_update(id self, SEL selector, long state)
+{
+	static int said;
+
+	if (said++ < 12) {
+		say("hakios: bluetooth: Control Center's Bluetooth button: -_updateWithState:%ld\n", state);
+	}
+	((void (*)(id, SEL, long))original_cc_bt_update)(self, selector, state);
+}
+
+static void
+cc_bt_toggle(id self, SEL selector)
+{
+	say("hakios: bluetooth: Control Center's Bluetooth button: -_toggleState (a tap)\n");
+	((void (*)(id, SEL))original_cc_bt_toggle)(self, selector);
+}
+
+static void
+cc_bt_hook(void)
+{
+	static bool done;
+	Class c;
+
+	if (done || (c = objc_getClass("CCUIConnectivityBluetoothViewController")) == Nil) {
+		return;
+	}
+	done = true;
+	Method u = class_getInstanceMethod(c, sel_registerName("_updateWithState:"));
+	Method t = class_getInstanceMethod(c, sel_registerName("_toggleState"));
+
+	if (u != NULL) {
+		original_cc_bt_update = method_getImplementation(u);
+		class_replaceMethod(c, sel_registerName("_updateWithState:"), (IMP)cc_bt_update, method_getTypeEncoding(u));
+	}
+	if (t != NULL) {
+		original_cc_bt_toggle = method_getImplementation(t);
+		class_replaceMethod(c, sel_registerName("_toggleState"), (IMP)cc_bt_toggle, method_getTypeEncoding(t));
+	}
+	say("hakios: bluetooth: Control Center's Bluetooth button hooked (_updateWithState: %s, _toggleState %s)\n",
+	    u ? method_getTypeEncoding(u) : "none", t ? method_getTypeEncoding(t) : "none");
+}
+
 static void
 bt_watch(int round)
 {
+	cc_bt_hook();
 	static char last[160];
 	char line[160];
 	Class bm = objc_getClass("BluetoothManager");
@@ -779,7 +830,7 @@ bt_watch(int round)
 		}
 		strlcpy(last, line, sizeof(last));
 	}
-	if (round < 100) {
+	if (round < 400) {
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
 			bt_watch(round + 1);
 		});

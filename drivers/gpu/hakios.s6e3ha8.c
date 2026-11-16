@@ -621,7 +621,7 @@ panel_dsc(void)
 static struct panel_reg {
 	uint8_t reg, len;               /* the register and its parameters' bytes (Samsung's arrays less the opcode) */
 	const char *what;
-	uint8_t val[12];
+	uint8_t val[96];
 	bool have;
 } panel_regs[] = {
 	{ 0xC5, 5, "FFC (Samsung C5 0D 10 B4 3E 01)", { 0 }, false },
@@ -630,6 +630,20 @@ static struct panel_reg {
 	{ 0xED, 1, "ERR_FG (ED 4C)", { 0 }, false },
 	{ 0xB9, 9, "TSP_HSYNC (B9 01 B0 91 09 00 00 00 11 03)", { 0 }, false },
 	{ 0xBA, 5, "scaler (BA 01 26 08 08 F3)", { 0 }, false },
+	/*
+	 * And Samsung's brightness sequence (PANEL_SET_BL_SEQ of crown_a3_s0: gamma, AOR, TSET/MPS/ELVSS, ELVSS temperature,
+	 * VGH/VINT, ACL control and dim frames, ACL on/off, IRC value and on, POC compensation, then F7 03), of which only
+	 * the AOR was sent again here (panel_gamma=0). Read long enough to take the parameters Samsung writes at an offset
+	 * (ACL dim frames at 0x0F of B4, POC at 0x06 of B1 and 0x53 of B8, ELVSS and IRC at offsets of B5 and B8): step 96's
+	 * black lines stayed with the mode, DSC, TE and the link all good, the panel's emission settings being what is left.
+	 */
+	{ 0xCA, 37, "gamma (CA 07 80 80 ...)", { 0 }, false },
+	{ 0xB1, 16, "AOR and POC (B1 00 0C, POC at 06)", { 0 }, false },
+	{ 0xB5, 32, "TSET/MPS/ELVSS (B5 19 DC 0A, temperature further on)", { 0 }, false },
+	{ 0xF4, 8, "VGH/VINT (F4 EB 23)", { 0 }, false },
+	{ 0xB4, 16, "ACL control and dim frames (B4 00 44 80 65 26 00, 20 at 0F)", { 0 }, false },
+	{ 0x55, 1, "ACL on/off (55 00)", { 0 }, false },
+	{ 0xB8, 88, "IRC and POC (B8 20 69 E7 ..., 0F FF at 53)", { 0 }, false },
 };
 static bool panel_regs_taken;
 
@@ -637,7 +651,7 @@ static bool panel_regs_taken;
 static void
 panel_regs_take(void)
 {
-	char line[96];
+	char line[300];
 
 	panel_regs_taken = true;
 	if (!panel_keys(true)) {
@@ -678,14 +692,19 @@ panel_regs_put(void)
 		memcpy(buf + 1, panel_regs[i].val, panel_regs[i].len);
 		ok = dsim_send(buf, 1u + panel_regs[i].len) && ok;
 	}
+	{
+		static const uint8_t update[] = { 0xF7, 0x03 };    /* (the brightness registers taken: Samsung's sequence ends so) */
+
+		ok = dsim_send(update, sizeof(update)) && ok;
+	}
 	ok = panel_keys(false) && ok;
 	{
-		char line[200];
+		char line[300];
 		size_t at = 0;
 
 		for (size_t i = 0; i < sizeof(panel_regs) / sizeof(panel_regs[0]) && at + 40 < sizeof(line); i++) {
 			at += (size_t)snprintf(line + at, sizeof(line) - at, " %02X:", panel_regs[i].reg);
-			for (uint32_t k = 0; k < panel_regs[i].len && at + 4 < sizeof(line); k++) {
+			for (uint32_t k = 0; k < panel_regs[i].len && k < 6 && at + 4 < sizeof(line); k++) {
 				at += (size_t)snprintf(line + at, sizeof(line) - at, panel_regs[i].have ? "%02X" : "--", panel_regs[i].val[k]);
 			}
 		}
