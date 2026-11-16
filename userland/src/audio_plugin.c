@@ -1073,7 +1073,7 @@ actuator_write(const int16_t *samples, UInt32 frames)
 
 static OSStatus
 do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectID object, AudioObjectID stream,
-    __unused UInt32 client, UInt32 operation, UInt32 frames, __unused const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
+    __unused UInt32 client, UInt32 operation, UInt32 frames, const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
     __unused void *secondary)
 {
 	const struct device *d = device_of(stream);
@@ -1082,6 +1082,27 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 		return kAudioHardwareBadObjectError;
 	}
 	if (operation == kAudioServerPlugInIOOperationReadInput && stream == OBJECT_CODEC_INPUT) {
+		/*
+		 * The microphone's I/O as the HAL runs it, said every 5 s: how many cycles, how many frames, against the time that
+		 * went by (step 98: the camera's audio reached its node at a tenth of real time while the kernel was read in real
+		 * time -- where between here and the node is it lost?).
+		 */
+		static UInt64 since, calls, framed;
+		UInt64 now = mach_absolute_time();
+
+		if (since == 0) {
+			since = now;
+		}
+		calls++;
+		framed += frames;
+		if ((Float64)(now - since) >= 5.0 * HAKIOS_AUDIO_RATE * ticks_per_frame) {
+			Float64 seconds = (Float64)(now - since) / (HAKIOS_AUDIO_RATE * ticks_per_frame);
+
+			say("hakios: audio: mic I/O: %llu cycles, %llu frames in %.2f s (%.0f frames a second; %u a cycle; input time %.0f)\n",
+			    calls, framed, seconds, (Float64)framed / seconds, (unsigned)frames, cycle != NULL ? cycle->mInputTime.mSampleTime : -1.0);
+			since = now;
+			calls = framed = 0;
+		}
 		codec_read(buffer, frames);
 	} else if (operation == kAudioServerPlugInIOOperationReadInput) {
 		/* the speaker's and Hawking's inputs: silence */
