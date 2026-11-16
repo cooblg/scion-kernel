@@ -178,6 +178,7 @@ say(const char *format, ...)
 static vm_offset_t dsim;
 static lck_mtx_t *panel_lock;
 static int panel_level = -1;
+static volatile bool panel_asleep;      /* put to sleep by panel_display(): the next on wakes it first */
 static int panel_wanted = -1;   /* the last level asked for (panel_set), sent or not: what a wake puts back */
 static bool panel_send_level(int level, uint32_t *aor_out);
 static int panel_set_said(int level, uint32_t aor, bool ok);
@@ -481,6 +482,23 @@ panel_set(int level)
 	}
 	lck_mtx_lock(panel_lock);
 	panel_wanted = level;
+	/*
+	 * Not to a panel asleep: iOS lowers the level to 0 just after the screen goes off, which reached the panel after its
+	 * sleep-in -- AOR and F7 03 (take the registers) written into a sleeping panel, at every screen-off of steps 89-99,
+	 * and the woken panel showed black lines whatever the wake sent (none in step 94, where it never slept). Hypothesis
+	 * S5. Kept as the level asked for; the wake sends it (panel_wanted).
+	 */
+	if (panel_asleep) {
+		lck_mtx_unlock(panel_lock);
+		{
+			static int said;
+
+			if (said++ < 4) {
+				say("s6e3ha8: brightness %d asked for while the panel sleeps: kept for the wake, not sent\n", level);
+			}
+		}
+		return 0;
+	}
 	ok = panel_send_level(level, &aor);
 	if (ok) {
 		panel_level = level;
@@ -590,7 +608,6 @@ static int panel_display_state = -1;
  * again; kern.hakios.panel_sleep=0 goes back to 28/29 alone.
  */
 static int panel_sleep = 1;     /* (step 94's A/B: off, no lines; on again in step 95 to count the link's errors with the lines) */
-static volatile bool panel_asleep;      /* put to sleep by panel_display(): the next on wakes it first */
 
 /*
  * Whether the panel is asleep -- from the sleep-in until its display-on after the wake. While it is, it sends no TE, so the
