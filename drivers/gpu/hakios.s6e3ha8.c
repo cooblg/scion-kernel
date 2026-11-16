@@ -563,7 +563,7 @@ static int panel_display_state = -1;
  * sent again here at every wake (panel_restore), for the mode the DECON drives, 1440x2960 (scaler off). On by default
  * again; kern.hakios.panel_sleep=0 goes back to 28/29 alone.
  */
-static int panel_sleep = 1;
+static int panel_sleep = 0;     /* (step 94: off again, an A/B test -- the lines stayed with everything restored at the wake) */
 static volatile bool panel_asleep;      /* put to sleep by panel_display(): the next on wakes it first */
 
 /*
@@ -678,6 +678,18 @@ panel_regs_put(void)
 		ok = dsim_send(buf, 1u + panel_regs[i].len) && ok;
 	}
 	ok = panel_keys(false) && ok;
+	{
+		char line[200];
+		size_t at = 0;
+
+		for (size_t i = 0; i < sizeof(panel_regs) / sizeof(panel_regs[0]) && at + 40 < sizeof(line); i++) {
+			at += (size_t)snprintf(line + at, sizeof(line) - at, " %02X:", panel_regs[i].reg);
+			for (uint32_t k = 0; k < panel_regs[i].len && at + 4 < sizeof(line); k++) {
+				at += (size_t)snprintf(line + at, sizeof(line) - at, panel_regs[i].have ? "%02X" : "--", panel_regs[i].val[k]);
+			}
+		}
+		say("s6e3ha8: the boot loader's registers written back:%s\n", line);
+	}
 	return ok;
 }
 
