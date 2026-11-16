@@ -698,6 +698,55 @@ static bool panel_regs_taken;
  * sent there makes them. 1 sends it all again, as in step 98.
  */
 static int panel_restore_all;
+
+/*
+ * kern.hakios.panel_reset (1, the default since step 101): the panel held in reset while it sleeps, as Samsung's suspend
+ * leaves it (lcd-reset low, then its regulators off -- those, on the S2DOS05 at 0x60 of hsi2c@14350000, are left on
+ * here), and brought out of it at the wake with the whole of Samsung's init sent again. Every wake that only sent things
+ * to a panel slept-in and slept-out (steps 89-100) left black horizontal lines; one never put to sleep (step 94) had none:
+ * this panel is not to be woken from a sleep-in without a reset. The pin: crown26.dts's panel_drv gpio,lcd-reset =
+ * <gpa3 4 active-low>, gpa3 of ALIVE's GPIO at 0x14050000 + 0x080 (as hakios.w9018.c reads its pins there).
+ */
+static int panel_reset_mode = 1;
+static bool panel_was_reset;
+static vm_offset_t alive_gpio;
+SYSCTL_INT(_kern_hakios, OID_AUTO, panel_reset, CTLFLAG_RW | CTLFLAG_LOCKED, &panel_reset_mode, 0,
+    "the panel held in reset while asleep and fully set up again at the wake (1), or slept-in and out only (0)");
+
+#define ALIVE_GPIO_PA   0x14050000UL
+#define GPA3_CON        0x080
+#define GPA3_DAT        0x084
+#define LCD_RESET_PIN   4
+
+/* the reset line: high, the panel running; low, held in reset. Its pin made an output first if it is not one. */
+static bool
+panel_reset_line(int high)
+{
+	volatile uint32_t *con, *dat;
+	uint32_t c0, d0;
+	static int said;
+
+	if (alive_gpio == 0) {
+		alive_gpio = ml_io_map(ALIVE_GPIO_PA, 0x1000);
+	}
+	if (alive_gpio == 0) {
+		return false;
+	}
+	con = (volatile uint32_t *)(alive_gpio + GPA3_CON);
+	dat = (volatile uint32_t *)(alive_gpio + GPA3_DAT);
+	c0 = *con;
+	d0 = *dat;
+	if (((c0 >> (4 * LCD_RESET_PIN)) & 0xf) != 1) {
+		*con = (c0 & ~(0xfu << (4 * LCD_RESET_PIN))) | (1u << (4 * LCD_RESET_PIN));
+	}
+	*dat = high ? (d0 | (1u << LCD_RESET_PIN)) : (d0 & ~(1u << LCD_RESET_PIN));
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (said++ < 6) {
+		say("s6e3ha8: the panel's reset line (gpa3-4) %s: CON %08x -> %08x, DAT %02x -> %02x\n", high ? "high (running)" :
+		    "low (in reset)", c0, *con, d0 & 0xff, *dat & 0xff);
+	}
+	return true;
+}
 SYSCTL_INT(_kern_hakios, OID_AUTO, panel_restore, CTLFLAG_RW | CTLFLAG_LOCKED, &panel_restore_all, 0,
     "a wake sends the mode, DSC/PPS, TE and the boot loader's registers again (1) or only sleep-out and 29 (0)");
 
@@ -823,7 +872,15 @@ panel_display(int on)
 		lck_mtx_unlock(panel_lock);
 		hakios_scanout_hold(1);
 		lck_mtx_lock(panel_lock);
-		bool dsc = panel_restore_all ? panel_dsc() : true;
+		bool full = panel_restore_all || panel_was_reset;
+
+		if (panel_was_reset) {
+			(void)panel_reset_line(1);
+			lck_mtx_unlock(panel_lock);
+			delay(15 * 1000);       /* (out of reset: Samsung's panel_reset waits about 10 ms, then 5 before its init) */
+			lck_mtx_lock(panel_lock);
+		}
+		bool dsc = full ? panel_dsc() : true;
 
 		/* (the sleep-out whatever became of the DSC packets: a panel left asleep is worse than one decoding badly) */
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(sleep_out, 1);
@@ -832,8 +889,8 @@ panel_display(int on)
 		lck_mtx_unlock(panel_lock);
 		delay(120 * 1000);              /* the sleep-out's own wait before the next command */
 		lck_mtx_lock(panel_lock);
-		bool restored = panel_restore_all ? panel_restore() : true;
-		bool put = panel_restore_all ? panel_regs_put() : true; /* (after panel_restore: the boot loader's scaler wins) */
+		bool restored = full ? panel_restore() : true;
+		bool put = full ? panel_regs_put() : true;      /* (after panel_restore: the boot loader's scaler wins) */
 
 		ok = restored && ok;
 		/* the brightness again (panel_set takes the lock itself) */
@@ -856,8 +913,10 @@ panel_display(int on)
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
 		hakios_scanout_hold(0);
 		panel_asleep = false;
+		panel_was_reset = false;
 		say("s6e3ha8: woken (%s): DSC and PPS %s; scaler, CASET/PASET 1440x2960, SET_AREA, TE on %s; the boot loader's registers %s; "
-		    "brightness %d again (the last asked for)\n", panel_restore_all ? "all restored" : "sleep-out and 29 only: nothing below sent",
+		    "brightness %d again (the last asked for)\n", panel_was_reset ? "out of reset: all set up again" : full ? "all restored" :
+		    "sleep-out and 29 only: nothing below sent",
 		    dsc ? "sent" : "NOT SENT", restored ? "sent" : "NOT ALL SENT",
 		    !panel_regs_taken ? "not read" : put ? "written back" : "NOT ALL WRITTEN", panel_wanted);
 	} else if (!on && panel_sleep) {
@@ -886,6 +945,13 @@ panel_display(int on)
 		panel_asleep = ok;
 		if (!ok) {
 			hakios_scanout_hold(0);         /* (not asleep after all: its frames again) */
+		} else if (panel_reset_mode && panel_regs_taken) {
+			/* (Samsung waits after its sleep-in before the reset line goes low; the boot loader's registers are known, to
+			 * set the panel up again from nothing) */
+			lck_mtx_unlock(panel_lock);
+			delay(100 * 1000);
+			lck_mtx_lock(panel_lock);
+			panel_was_reset = panel_reset_line(0);
 		}
 	} else {
 		/* 28 or 29 alone (the default: a panel woken from sleep-in came back with black bands top and bottom, 15 Nov) */
