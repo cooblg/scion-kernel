@@ -707,7 +707,7 @@ static int panel_restore_all;
  * this panel is not to be woken from a sleep-in without a reset. The pin: crown26.dts's panel_drv gpio,lcd-reset =
  * <gpa3 4 active-low>, gpa3 of ALIVE's GPIO at 0x14050000 + 0x080 (as hakios.w9018.c reads its pins there).
  */
-static int panel_reset_mode = 1;
+static int panel_reset_mode = 0;      /* (off again in step 102: in step 101 the panel did not come back out of the reset -- black until reboot) */
 static bool panel_was_reset;
 static vm_offset_t alive_gpio;
 SYSCTL_INT(_kern_hakios, OID_AUTO, panel_reset, CTLFLAG_RW | CTLFLAG_LOCKED, &panel_reset_mode, 0,
