@@ -242,6 +242,7 @@ static struct device devices[] = {
 #define MANUFACTURER            CFSTR("redwood")
 /* how often a device says where its clock is, in frames: also the largest I/O buffer the HAL will use */
 #define TIMESTAMP_PERIOD        16384
+#define CLOCK_DOMAIN            0x686b6f73      /* 'hkos': one domain for every device of this plug-in */
 
 static AudioServerPlugInHostRef host;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -597,6 +598,15 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			WORD(d->object);
 			break;
 		case kAudioDevicePropertyClockDomain:
+			/*
+			 * One clock domain for all of ours, not 0 ("unknown"): every device here plays and records by the same clock
+			 * (clock_anchor, mach_absolute_time). With 0 the virtual audio device's aggregate of the microphone (Codec) and
+			 * the speaker took them for two clocks and corrected their drift: the camera's audio reached its node one
+			 * buffer every 280 ms of 21 ms cycles here, its times advancing at half its length, and among them buffers of
+			 * 10 000 s (step 100) -- the movie never finished.
+			 */
+			WORD(CLOCK_DOMAIN);
+			break;
 		case kAudioDevicePropertyLatency:
 		case kAudioDevicePropertySafetyOffset:
 		case kAudioDevicePropertyIsHidden:

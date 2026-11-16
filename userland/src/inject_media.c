@@ -442,6 +442,26 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 			return;
 		}
 	}
+	/*
+	 * An audio buffer of more than a second, which no capture makes: the audio source's "gap" of 10 000 s and more (step 99,
+	 * 448 039 462 frames at a pts 10 000 s in the past), from times it could not place. Not passed on: the movie's writer
+	 * cannot put it anywhere, and waited for ever (no moov). It carries no sound (no buffer holds that many frames).
+	 */
+	{
+		CMFormatDescriptionRef af = CMSampleBufferGetFormatDescription(sample_buffer);
+
+		if (af != NULL && CMFormatDescriptionGetMediaType(af) == kCMMediaType_Audio &&
+		    CMTimeGetSeconds(CMSampleBufferGetDuration(sample_buffer)) > 1.0) {
+			static int said;
+
+			if (said++ < 6) {
+				say("hakios: mediaserverd: an audio buffer of %.1f s (%ld frames, pts %.3f s) not passed on\n",
+				    CMTimeGetSeconds(CMSampleBufferGetDuration(sample_buffer)), (long)CMSampleBufferGetNumSamples(sample_buffer),
+				    CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample_buffer)));
+			}
+			return;
+		}
+	}
 	time_photo_encoder(self, sample_buffer);
 	/*
 	 * How far behind real time the buffers go out: the host clock now less the buffer's presentation time, every 100th
