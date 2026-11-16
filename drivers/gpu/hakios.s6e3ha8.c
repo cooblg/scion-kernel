@@ -573,6 +573,7 @@ static volatile bool panel_asleep;      /* put to sleep by panel_display(): the 
  * frame into the boot framebuffer by the processor from then on -- the ghosting and the stutter seen after every screen-off.
  */
 bool hakios_panel_asleep(void);
+extern void hakios_scanout_hold(int hold);    /* hakios.exynos_dpu.c (or the stub) */
 
 bool
 hakios_panel_asleep(void)
@@ -745,6 +746,10 @@ panel_display(int on)
 	 */
 	if (on && panel_asleep) {
 		static const uint8_t sleep_out[] = { 0x11 };
+		/* (the DECON's frames held while the panel is woken and set up: S2 of step 95; let go after 29) */
+		lck_mtx_unlock(panel_lock);
+		hakios_scanout_hold(1);
+		lck_mtx_lock(panel_lock);
 		bool dsc = panel_dsc();
 
 		/* (the sleep-out whatever became of the DSC packets: a panel left asleep is worse than one decoding badly) */
@@ -770,6 +775,7 @@ panel_display(int on)
 		shown = dsim_send(key_on, sizeof(key_on)) && dsim_send(display_on, 1);
 		ok = shown && ok;
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
+		hakios_scanout_hold(0);
 		panel_asleep = false;
 		say("s6e3ha8: woken: DSC and PPS %s; scaler, CASET/PASET 1440x2960, SET_AREA, TE on %s; the boot loader's registers %s; "
 		    "brightness %d again\n", dsc ? "sent" : "NOT SENT", restored ? "sent" : "NOT ALL SENT",
@@ -780,6 +786,15 @@ panel_display(int on)
 		if (!panel_regs_taken) {
 			panel_regs_take();      /* (the first sleep of the run: the panel still as the boot loader set it up) */
 		}
+		/*
+		 * (no frame in flight while it is turned off and put to sleep; held until the wake has set it up again. "Asleep"
+		 * from now on, before the hold: the framebuffer must not take a flip the held DECON does not take for a broken
+		 * scan-out -- the step 89 drop)
+		 */
+		panel_asleep = true;
+		lck_mtx_unlock(panel_lock);
+		hakios_scanout_hold(1);
+		lck_mtx_lock(panel_lock);
 
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(display_off, 1);
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
@@ -789,6 +804,9 @@ panel_display(int on)
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(sleep_in, 1) && ok;
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
 		panel_asleep = ok;
+		if (!ok) {
+			hakios_scanout_hold(0);         /* (not asleep after all: its frames again) */
+		}
 	} else {
 		/* 28 or 29 alone (the default: a panel woken from sleep-in came back with black bands top and bottom, 15 Nov) */
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(on ? display_on : display_off, 1);

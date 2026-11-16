@@ -239,6 +239,8 @@ int hakios_scanout_flip(__unused unsigned index) { return -1; }
 int hakios_scanout_latched(void) { return 1; }
 void hakios_scanout_detach(__unused const char *why) {}
 uint32_t hakios_scanout_refreshes(void) { return 0; }
+void hakios_scanout_hold(int hold);
+void hakios_scanout_hold(__unused int hold) {}
 int hakios_scanout_carve(uint64_t bytes, uint64_t *phys);
 void hakios_scanout_uncarve(uint64_t phys);
 int hakios_scanout_carved(uint64_t phys);
