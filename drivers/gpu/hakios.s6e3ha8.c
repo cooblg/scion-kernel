@@ -563,7 +563,7 @@ static int panel_display_state = -1;
  * sent again here at every wake (panel_restore), for the mode the DECON drives, 1440x2960 (scaler off). On by default
  * again; kern.hakios.panel_sleep=0 goes back to 28/29 alone.
  */
-static int panel_sleep = 0;     /* (step 94: off again, an A/B test -- the lines stayed with everything restored at the wake) */
+static int panel_sleep = 1;     /* (step 94's A/B: off, no lines; on again in step 95 to count the link's errors with the lines) */
 static volatile bool panel_asleep;      /* put to sleep by panel_display(): the next on wakes it first */
 
 /*
@@ -732,6 +732,13 @@ panel_display(int on)
 	   bit 4 sleep out) and 0D (display mode): whether 28 changed anything there */
 	read_before = panel_read(0x0A, &before, 1) && panel_read(0x0D, &mode_before, 1);
 	/*
+	 * DCS 05 (get_error_count_on_DSI: bit 7 overflow, bits 6-0 the count of DSI errors the panel has seen since it was last
+	 * read): before this change (the errors over the time the screen was on) and after it. With sleep-in the woken panel
+	 * shows black lines (steps 89-93), without it none (step 94): whether the link itself fails after a wake.
+	 */
+	uint8_t dsi_errors_before = 0xff, dsi_errors_after = 0xff;
+	bool errors_read_before = panel_read(0x05, &dsi_errors_before, 1);
+	/*
 	 * Display-off alone (28) left the panel faintly lit (14-15 November: the screen grey-black, not off): its circuits
 	 * stay up. Off is now 28 then sleep-in (10), as Samsung's suspend sends them; on is sleep-out (11), its 120 ms, what
 	 * the panel lost in the sleep (panel_restore: it does NOT keep its mode and TE, as was first assumed), then 29.
@@ -797,7 +804,11 @@ panel_display(int on)
 	}
 	delay(30 * 1000);
 	read_after = panel_read(0x0A, &after, 1) && panel_read(0x0D, &mode_after, 1);
+	bool errors_read_after = panel_read(0x05, &dsi_errors_after, 1);
 	lck_mtx_unlock(panel_lock);
+	say("s6e3ha8: the panel's DSI errors (DCS 05): before the %s %s%u%s, 30 ms after %s%u%s\n", on ? "wake" : "screen-off",
+	    errors_read_before ? "" : "(NOT READ) ", dsi_errors_before & 0x7f, (dsi_errors_before & 0x80) && errors_read_before ? "+" : "",
+	    errors_read_after ? "" : "(NOT READ) ", dsi_errors_after & 0x7f, (dsi_errors_after & 0x80) && errors_read_after ? "+" : "");
 	say("s6e3ha8: display %s (%s) (FIFOCTRL %x, INTSRC %x); power mode 0A/0D before %s%02x/%02x, 30 ms after %s%02x/%02x\n",
 	    on ? "on" : "off", ok ? "sent" : "NOT SENT", rd(DSIM_FIFOCTRL), rd(DSIM_INTSRC),
 	    read_before ? "" : "(NOT READ) ", before, mode_before, read_after ? "" : "(NOT READ) ", after, mode_after);
