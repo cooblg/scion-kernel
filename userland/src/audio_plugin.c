@@ -1095,6 +1095,27 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 		}
 		calls++;
 		framed += frames;
+		/*
+		 * The first cycles' times as the HAL gives them (step 99: the camera's audio node made buffers of 448 039 462
+		 * frames, 10 159 s long, from a gap it saw in its input's times): sample time, host time (and that in seconds),
+		 * the flags, and where our own zero time stamp is.
+		 */
+		{
+			static unsigned told;
+
+			if (cycle != NULL && told++ < 24) {
+				Float64 sample = 0;
+				UInt64 host = 0, seed = 0;
+
+				(void)get_zero_time_stamp(NULL, OBJECT_CODEC, 0, &sample, &host, &seed);
+				say("hakios: audio: mic cycle %u: input sample %.0f host %llu (%.6f s) flags %x; output sample %.0f host %llu; "
+				    "zero %.0f at %llu; now %llu\n", told, cycle->mInputTime.mSampleTime,
+				    (unsigned long long)cycle->mInputTime.mHostTime,
+				    (Float64)cycle->mInputTime.mHostTime / (HAKIOS_AUDIO_RATE * ticks_per_frame), (unsigned)cycle->mInputTime.mFlags,
+				    cycle->mOutputTime.mSampleTime, (unsigned long long)cycle->mOutputTime.mHostTime, sample,
+				    (unsigned long long)host, (unsigned long long)now);
+			}
+		}
 		if ((Float64)(now - since) >= 5.0 * HAKIOS_AUDIO_RATE * ticks_per_frame) {
 			Float64 seconds = (Float64)(now - since) / (HAKIOS_AUDIO_RATE * ticks_per_frame);
 
