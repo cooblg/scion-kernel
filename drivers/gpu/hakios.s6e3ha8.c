@@ -673,6 +673,17 @@ static struct panel_reg {
 };
 static bool panel_regs_taken;
 
+/*
+ * kern.hakios.panel_restore: what a wake sends besides sleep-out, 29 and the brightness. 0 (the default since step 99):
+ * nothing else. Steps 89-98 sent DSC/PPS, the mode, SET_AREA, TE and the boot loader's registers -- on the guess that the
+ * panel had lost them, from the black bands of a wake in step 76; those bands were the framebuffer falling back to the boot
+ * window (the scan-out dropped, fixed in step 91), and the black lines stayed whatever was sent. Hypothesis S4: something
+ * sent there makes them. 1 sends it all again, as in step 98.
+ */
+static int panel_restore_all;
+SYSCTL_INT(_kern_hakios, OID_AUTO, panel_restore, CTLFLAG_RW | CTLFLAG_LOCKED, &panel_restore_all, 0,
+    "a wake sends the mode, DSC/PPS, TE and the boot loader's registers again (1) or only sleep-out and 29 (0)");
+
 /* panel_lock held, the panel awake and as the boot loader left it */
 static void
 panel_regs_take(void)
@@ -795,7 +806,7 @@ panel_display(int on)
 		lck_mtx_unlock(panel_lock);
 		hakios_scanout_hold(1);
 		lck_mtx_lock(panel_lock);
-		bool dsc = panel_dsc();
+		bool dsc = panel_restore_all ? panel_dsc() : true;
 
 		/* (the sleep-out whatever became of the DSC packets: a panel left asleep is worse than one decoding badly) */
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(sleep_out, 1);
@@ -804,8 +815,8 @@ panel_display(int on)
 		lck_mtx_unlock(panel_lock);
 		delay(120 * 1000);              /* the sleep-out's own wait before the next command */
 		lck_mtx_lock(panel_lock);
-		bool restored = panel_restore();
-		bool put = panel_regs_put();    /* (after panel_restore: the boot loader's own scaler wins over Samsung's) */
+		bool restored = panel_restore_all ? panel_restore() : true;
+		bool put = panel_restore_all ? panel_regs_put() : true; /* (after panel_restore: the boot loader's scaler wins) */
 
 		ok = restored && ok;
 		/* the brightness again (panel_set takes the lock itself) */
@@ -828,8 +839,9 @@ panel_display(int on)
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
 		hakios_scanout_hold(0);
 		panel_asleep = false;
-		say("s6e3ha8: woken: DSC and PPS %s; scaler, CASET/PASET 1440x2960, SET_AREA, TE on %s; the boot loader's registers %s; "
-		    "brightness %d again (the last asked for)\n", dsc ? "sent" : "NOT SENT", restored ? "sent" : "NOT ALL SENT",
+		say("s6e3ha8: woken (%s): DSC and PPS %s; scaler, CASET/PASET 1440x2960, SET_AREA, TE on %s; the boot loader's registers %s; "
+		    "brightness %d again (the last asked for)\n", panel_restore_all ? "all restored" : "sleep-out and 29 only: nothing below sent",
+		    dsc ? "sent" : "NOT SENT", restored ? "sent" : "NOT ALL SENT",
 		    !panel_regs_taken ? "not read" : put ? "written back" : "NOT ALL WRITTEN", panel_wanted);
 	} else if (!on && panel_sleep) {
 		static const uint8_t sleep_in[] = { 0x10 };
