@@ -178,6 +178,9 @@ say(const char *format, ...)
 static vm_offset_t dsim;
 static lck_mtx_t *panel_lock;
 static int panel_level = -1;
+static int panel_wanted = -1;   /* the last level asked for (panel_set), sent or not: what a wake puts back */
+static bool panel_send_level(int level, uint32_t *aor_out);
+static int panel_set_said(int level, uint32_t aor, bool ok);
 static uint32_t panel_failures, read_failures;
 
 /* the gamma, once worked out from the MTP at start (read only after) */
@@ -470,14 +473,36 @@ panel_gamma_init(uint32_t mode)
 static int
 panel_set(int level)
 {
-	static const uint8_t key_on[] = { 0xF0, 0x5A, 0x5A }, take[] = { 0xF7, 0x03 }, key_off[] = { 0xF0, 0xA5, 0xA5 };
-	uint8_t gamma[1 + HA8_CA] = { REG_GAMMA };
 	uint32_t aor;
 	bool ok;
 
 	if (dsim == 0 || level < 0 || level > 255) {
 		return EINVAL;
 	}
+	lck_mtx_lock(panel_lock);
+	panel_wanted = level;
+	ok = panel_send_level(level, &aor);
+	if (ok) {
+		panel_level = level;
+	} else {
+		panel_failures++;
+	}
+	lck_mtx_unlock(panel_lock);
+	return panel_set_said(level, aor, ok);
+}
+
+/*
+ * The level's packets, panel_lock held: gamma row and AOR, or (the fallback) the AOR alone, the light made to follow the
+ * level's square (a dim end that is usable). Its AOR in *aor_out.
+ */
+static bool
+panel_send_level(int level, uint32_t *aor_out)
+{
+	static const uint8_t key_on[] = { 0xF0, 0x5A, 0x5A }, take[] = { 0xF7, 0x03 }, key_off[] = { 0xF0, 0xA5, 0xA5 };
+	uint8_t gamma[1 + HA8_CA] = { REG_GAMMA };
+	uint32_t aor;
+	bool ok;
+
 	if (gamma_ready) {
 		int row = ha8_row_of_level(level);
 
@@ -495,17 +520,18 @@ panel_set(int level)
 	}
 	uint8_t aor_packet[] = { REG_AOR, (uint8_t)(aor >> 8), (uint8_t)aor };
 
-	lck_mtx_lock(panel_lock);
 	ok = dsim_send(key_on, sizeof(key_on));
 	ok = ok && (!gamma_ready || dsim_send(gamma, sizeof(gamma)));
 	ok = ok && dsim_send(aor_packet, sizeof(aor_packet)) && dsim_send(take, sizeof(take));
 	ok = dsim_send(key_off, sizeof(key_off)) && ok;         /* (the key off whatever happened) */
-	if (ok) {
-		panel_level = level;
-	} else {
-		panel_failures++;
-	}
-	lck_mtx_unlock(panel_lock);
+	*aor_out = aor;
+	return ok;
+}
+
+/* panel_set's line (not under the lock) */
+static int
+panel_set_said(int level, uint32_t aor, bool ok)
+{
 	if (!ok && panel_failures <= 3) {
 		say("s6e3ha8: brightness %d (%s, AOR 0x%x) not sent: the DSIM's FIFO did not take it "
 		    "(FIFOCTRL %x, INTSRC %x)\n", level, gamma_ready ? "gamma row and AOR" : "AOR alone", aor,
@@ -783,12 +809,18 @@ panel_display(int on)
 
 		ok = restored && ok;
 		/* the brightness again (panel_set takes the lock itself) */
-		if (panel_level >= 0) {
-			int level = panel_level;
+		/*
+		 * The level asked for LAST, sent here under the lock. It was a copy taken before the wake, sent with the lock let go:
+		 * iOS's own level for the screen coming back (89) got in meanwhile and the stale 0 of the screen-off went out over
+		 * it -- the panel at its dimmest AOR (0x0B76) for good, and that duty showed as black horizontal lines (steps 89-97;
+		 * none in step 94, without the wake, where 89 stayed).
+		 */
+		if (panel_wanted >= 0) {
+			uint32_t aor;
 
-			lck_mtx_unlock(panel_lock);
-			(void)panel_set(level);
-			lck_mtx_lock(panel_lock);
+			if (panel_send_level(panel_wanted, &aor)) {
+				panel_level = panel_wanted;
+			}
 		}
 		delay(20 * 1000);               /* a frame with the settings in before the output goes on */
 		shown = dsim_send(key_on, sizeof(key_on)) && dsim_send(display_on, 1);
@@ -797,8 +829,8 @@ panel_display(int on)
 		hakios_scanout_hold(0);
 		panel_asleep = false;
 		say("s6e3ha8: woken: DSC and PPS %s; scaler, CASET/PASET 1440x2960, SET_AREA, TE on %s; the boot loader's registers %s; "
-		    "brightness %d again\n", dsc ? "sent" : "NOT SENT", restored ? "sent" : "NOT ALL SENT",
-		    !panel_regs_taken ? "not read" : put ? "written back" : "NOT ALL WRITTEN", panel_level);
+		    "brightness %d again (the last asked for)\n", dsc ? "sent" : "NOT SENT", restored ? "sent" : "NOT ALL SENT",
+		    !panel_regs_taken ? "not read" : put ? "written back" : "NOT ALL WRITTEN", panel_wanted);
 	} else if (!on && panel_sleep) {
 		static const uint8_t sleep_in[] = { 0x10 };
 

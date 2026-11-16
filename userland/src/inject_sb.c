@@ -739,14 +739,33 @@ battery_post_notifications(void)
 static IMP original_cc_bt_update, original_cc_bt_toggle;
 
 static void
-cc_bt_update(id self, SEL selector, long state)
+cc_bt_update(id self, SEL selector, int state)
 {
 	static int said;
+	Ivar iv = class_getInstanceVariable(object_getClass(self), "_bluetoothManager");
+	id held = iv != NULL ? object_getIvar(self, iv) : nil;
+	Class bm = objc_getClass("BluetoothManager");
+	id shared = bm != Nil ? ((id (*)(Class, SEL))objc_msgSend)(bm, sel_registerName("sharedInstance")) : nil;
+	int real = shared != nil ? (int)((long (*)(id, SEL))objc_msgSend)(shared, sel_registerName("bluetoothState")) : -1;
 
 	if (said++ < 12) {
-		say("hakios: bluetooth: Control Center's Bluetooth button: -_updateWithState:%ld\n", state);
+		say("hakios: bluetooth: Control Center's Bluetooth button: -_updateWithState:%d; its _bluetoothManager %p, the shared "
+		    "one %p (state %d)\n", state, (void *)held, (void *)shared, real);
 	}
-	((void (*)(id, SEL, long))original_cc_bt_update)(self, selector, state);
+	/*
+	 * Step 97: the button was given state 0 (inoperative: grey, taps not taken) while BluetoothManager's shared instance
+	 * said 3. Its own _bluetoothManager is what it reads: if that is not the shared one (nil, or another that never
+	 * attached), the shared one is put there, and the state given is the shared one's.
+	 */
+	if (iv != NULL && shared != nil && held != shared) {
+		object_setIvarWithStrongDefault(self, iv, shared);
+		say("hakios: bluetooth: Control Center's Bluetooth button: its _bluetoothManager was %p: the shared one put there\n",
+		    (void *)held);
+	}
+	if (state == 0 && real > 0) {
+		state = real;
+	}
+	((void (*)(id, SEL, int))original_cc_bt_update)(self, selector, state);
 }
 
 static void
