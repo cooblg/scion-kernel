@@ -1013,16 +1013,29 @@ panel_display(int on)
 		return ENODEV;
 	}
 	lck_mtx_lock(panel_lock);
+	/*
+	 * Off again while already asleep (step 108, 18 November: backboardd crashed at boot just after iOS's first screen-off,
+	 * and its successor turned the screen off a second time): the panel is in reset, its clock lane in LP. That second
+	 * screen-off sent 28 and 10 to a panel that cannot take them, filled the DSIM's FIFO, and left "asleep" false with the
+	 * panel still in reset -- so the screen-on that followed sent 29 alone and the panel was never brought back: black
+	 * after the Apple logo, for good. Already off is off: nothing is sent.
+	 */
+	if (!on && panel_asleep) {
+		lck_mtx_unlock(panel_lock);
+		panel_display_state = 0;
+		say("s6e3ha8: display off asked for while the panel already sleeps%s: nothing sent\n", panel_was_reset ? " in reset" : "");
+		return 0;
+	}
 	/* what the panel says of itself, before and 30 ms after: DCS 0A (power mode: bit 2 display on, bit 3 normal mode,
 	   bit 4 sleep out) and 0D (display mode): whether 28 changed anything there */
-	read_before = !(on && panel_was_reset) && panel_read(0x0A, &before, 1) && panel_read(0x0D, &mode_before, 1);
+	read_before = !(on && (panel_was_reset || panel_asleep)) && panel_read(0x0A, &before, 1) && panel_read(0x0D, &mode_before, 1);
 	/*
 	 * DCS 05 (get_error_count_on_DSI: bit 7 overflow, bits 6-0 the count of DSI errors the panel has seen since it was last
 	 * read): before this change (the errors over the time the screen was on) and after it. With sleep-in the woken panel
 	 * shows black lines (steps 89-93), without it none (step 94): whether the link itself fails after a wake.
 	 */
 	uint8_t dsi_errors_before = 0xff, dsi_errors_after = 0xff;
-	bool errors_read_before = !(on && panel_was_reset) && panel_read(0x05, &dsi_errors_before, 1);
+	bool errors_read_before = !(on && (panel_was_reset || panel_asleep)) && panel_read(0x05, &dsi_errors_before, 1);
 	/*
 	 * Display-off alone (28) left the panel faintly lit (14-15 November: the screen grey-black, not off): its circuits
 	 * stay up. Off is now 28 then sleep-in (10), as Samsung's suspend sends them; on is sleep-out (11), its 120 ms, what
