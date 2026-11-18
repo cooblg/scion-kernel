@@ -882,7 +882,19 @@ panel_regs_take(void)
 		struct panel_reg *r = &panel_regs[i];
 		size_t at = 0;
 
-		r->have = panel_read(r->reg, r->val, r->len);
+		/*
+		 * Read twice, kept only when both agree (step 106: twice the screen stayed black after the Apple logo, with the
+		 * panel taken out of reset at the boot's first screen-off and these values written into it; reads made while
+		 * frames went out came back of the wrong length -- a value read wrong and written back would leave the panel
+		 * "up" and dark, which nothing here would notice)
+		 */
+		uint8_t again[sizeof(r->val)];
+		bool first = panel_read(r->reg, r->val, r->len), second = first && panel_read(r->reg, again, r->len);
+
+		r->have = first && second && memcmp(r->val, again, r->len) == 0;
+		if (first && second && !r->have) {
+			say("s6e3ha8: the boot loader's %02X read twice, two answers: NOT written back\n", r->reg);
+		}
 		for (uint32_t k = 0; r->have && k < r->len && at + 4 < sizeof(line); k++) {
 			at += (size_t)snprintf(line + at, sizeof(line) - at, " %02X", r->val[k]);
 		}
@@ -915,6 +927,29 @@ panel_regs_put(void)
 		static const uint8_t update[] = { 0xF7, 0x03 };    /* (the brightness registers taken: Samsung's sequence ends so) */
 
 		ok = dsim_send(update, sizeof(update)) && ok;
+	}
+	/* what the panel holds now, read back (no frame going out yet at a wake): a register that differs is logged */
+	{
+		unsigned same = 0, differ = 0, unread = 0;
+
+		for (size_t i = 0; i < sizeof(panel_regs) / sizeof(panel_regs[0]); i++) {
+			uint8_t now[sizeof(panel_regs[0].val)];
+
+			if (!panel_regs[i].have) {
+				continue;
+			}
+			if (!panel_read(panel_regs[i].reg, now, panel_regs[i].len)) {
+				unread++;
+			} else if (memcmp(now, panel_regs[i].val, panel_regs[i].len) == 0) {
+				same++;
+			} else {
+				differ++;
+				say("s6e3ha8: written back %02X, read back otherwise: %02X %02X %02X %02X (written %02X %02X %02X %02X)\n",
+				    panel_regs[i].reg, now[0], now[1], now[2], now[3], panel_regs[i].val[0], panel_regs[i].val[1],
+				    panel_regs[i].val[2], panel_regs[i].val[3]);
+			}
+		}
+		say("s6e3ha8: the boot loader's registers read back: %u as written, %u otherwise, %u not read\n", same, differ, unread);
 	}
 	ok = panel_keys(false) && ok;
 	{
@@ -1075,11 +1110,6 @@ panel_display(int on)
 	} else if (!on && panel_sleep) {
 		static const uint8_t sleep_in[] = { 0x10 };
 
-		if (!panel_regs_taken) {
-			panel_regs_take();      /* (the first sleep of the run: the panel still as the boot loader set it up) */
-			disp_det_on = panel_disp_det();
-			say("s6e3ha8: disp_det with the panel on: %d\n", disp_det_on);
-		}
 		/*
 		 * (no frame in flight while it is turned off and put to sleep; held until the wake has set it up again. "Asleep"
 		 * from now on, before the hold: the framebuffer must not take a flip the held DECON does not take for a broken
@@ -1088,7 +1118,16 @@ panel_display(int on)
 		panel_asleep = true;
 		lck_mtx_unlock(panel_lock);
 		hakios_scanout_hold(1);
+		if (!panel_regs_taken) {
+			delay(20 * 1000);       /* (the frame in flight out, before anything is read) */
+		}
 		lck_mtx_lock(panel_lock);
+		if (!panel_regs_taken) {
+			/* (the first sleep of the run: the panel still as the boot loader set it up; read with no frame going out) */
+			panel_regs_take();
+			disp_det_on = panel_disp_det();
+			say("s6e3ha8: disp_det with the panel on: %d\n", disp_det_on);
+		}
 
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(display_off, 1);
 		ok = dsim_send(key_off, sizeof(key_off)) && ok;
