@@ -1129,8 +1129,11 @@ panel_display(int on)
 		panel_display_state = on ? 1 : 0;
 	}
 	delay(30 * 1000);
-	read_after = panel_read(0x0A, &after, 1) && panel_read(0x0D, &mode_after, 1);
-	bool errors_read_after = panel_read(0x05, &dsi_errors_after, 1);
+	/* (not asked of a panel just put in reset: it cannot answer, and the three tries of each read cost 0.6 s, step 103) */
+	bool in_reset = !on && panel_was_reset;
+
+	read_after = !in_reset && panel_read(0x0A, &after, 1) && panel_read(0x0D, &mode_after, 1);
+	bool errors_read_after = !in_reset && panel_read(0x05, &dsi_errors_after, 1);
 	lck_mtx_unlock(panel_lock);
 	say("s6e3ha8: the panel's DSI errors (DCS 05): before the %s %s%u%s, 30 ms after %s%u%s\n", on ? "wake" : "screen-off",
 	    errors_read_before ? "" : "(NOT READ) ", dsi_errors_before & 0x7f, (dsi_errors_before & 0x80) && errors_read_before ? "+" : "",

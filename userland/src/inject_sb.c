@@ -800,10 +800,194 @@ cc_bt_hook(void)
 	    u ? method_getTypeEncoding(u) : "none", t ? method_getTypeEncoding(t) : "none");
 }
 
+/*
+ * Auto-lock (step 103, 18 November): set to 30 s, the screen never went off by itself; the side button works. What
+ * SpringBoard's idle timer is told is logged here (log only, every original called as it was): the timer descriptor it
+ * is given and why, the assertions that disable it and their reasons, its resets (counted by reason: who keeps it from
+ * running out), the attention-aware timer's resets "for user attention" (iPhone X's Attention Aware Features: the face
+ * seen by the TrueDepth camera this phone does not have), its warn (the dim) and its expiry (the lock).
+ * Types from SpringBoard's method lists (the shared cache).
+ */
+static IMP o_set_desc, o_acquire, o_src_enabled, o_reset_reason, o_reset_nc, o_reset_plain, o_bl_reset_att, o_bl_set_desc,
+    o_bl_att_lost, o_px_expire, o_px_warn;
+static unsigned idle_resets, idle_att_resets;
+static char idle_last_reason[96];
+
+static const char *
+idle_text(id object, char *buf, size_t size)
+{
+	id d = object != nil ? ((id (*)(id, SEL))objc_msgSend)(object, sel_registerName("description")) : nil;
+	const char *c = d != nil ? ((const char *(*)(id, SEL))objc_msgSend)(d, sel_registerName("UTF8String")) : NULL;
+
+	strlcpy(buf, c != NULL ? c : "(nil)", size);
+	for (char *q = buf; *q; q++) {
+		if (*q == '\n') {
+			*q = ' ';
+		}
+	}
+	return buf;
+}
+
+static void
+idle_set_desc(id self, SEL sel, id descriptor, id reason)
+{
+	char a[400], b[120];
+
+	say("hakios: idle: coordinator _setIdleTimerWithDescriptor: %s forReason: %s\n", idle_text(descriptor, a, sizeof(a)),
+	    idle_text(reason, b, sizeof(b)));
+	((void (*)(id, SEL, id, id))o_set_desc)(self, sel, descriptor, reason);
+}
+
+static id
+idle_acquire(id self, SEL sel, id reason)
+{
+	char b[160];
+
+	say("hakios: idle: idle-timer DISABLE assertion acquired for: %s\n", idle_text(reason, b, sizeof(b)));
+	return ((id (*)(id, SEL, id))o_acquire)(self, sel, reason);
+}
+
+static void
+idle_src_enabled(id self, SEL sel, BOOL enabled, id reason)
+{
+	char b[160];
+
+	say("hakios: idle: idle-timer source %s for: %s\n", enabled ? "ENABLED" : "DISABLED", idle_text(reason, b, sizeof(b)));
+	((void (*)(id, SEL, BOOL, id))o_src_enabled)(self, sel, enabled, reason);
+}
+
+static void
+idle_count_reset(const char *how, id reason)
+{
+	char b[96];
+
+	idle_text(reason, b, sizeof(b));
+	if (idle_resets++ < 20 || strcmp(b, idle_last_reason) != 0) {
+		say("hakios: idle: reset #%u (%s) for: %s\n", idle_resets, how, b);
+	}
+	strlcpy(idle_last_reason, b, sizeof(idle_last_reason));
+}
+
+static void
+idle_reset_reason(id self, SEL sel, id reason)
+{
+	idle_count_reset("resetIdleTimerForReason:", reason);
+	((void (*)(id, SEL, id))o_reset_reason)(self, sel, reason);
+}
+
+static void
+idle_reset_nc(id self, SEL sel, id source, id reason)
+{
+	idle_count_reset("resetIdleTimerIfNonConsecutiveSource:", reason);
+	((void (*)(id, SEL, id, id))o_reset_nc)(self, sel, source, reason);
+}
+
+static void
+idle_reset_plain(id self, SEL sel)
+{
+	idle_count_reset("resetIdleTimer", nil);
+	((void (*)(id, SEL))o_reset_plain)(self, sel);
+}
+
+static void
+idle_bl_reset_att(id self, SEL sel, id timer, unsigned long long attention, double at)
+{
+	if (idle_att_resets++ < 20 || idle_att_resets % 50 == 0) {
+		say("hakios: idle: backlight timer reset for user attention #%u (attention %llu, at %.1f)\n", idle_att_resets, attention, at);
+	}
+	((void (*)(id, SEL, id, unsigned long long, double))o_bl_reset_att)(self, sel, timer, attention, at);
+}
+
+static void
+idle_bl_set_desc(id self, SEL sel, id descriptor)
+{
+	char a[400];
+
+	say("hakios: idle: backlight timer descriptor: %s\n", idle_text(descriptor, a, sizeof(a)));
+	((void (*)(id, SEL, id))o_bl_set_desc)(self, sel, descriptor);
+}
+
+static void
+idle_bl_att_lost(id self, SEL sel, id timer, id timeout)
+{
+	char a[160];
+
+	say("hakios: idle: backlight timer: attention-lost timeout expired: %s\n", idle_text(timeout, a, sizeof(a)));
+	((void (*)(id, SEL, id, id))o_bl_att_lost)(self, sel, timer, timeout);
+}
+
+static void
+idle_px_expire(id self, SEL sel, id timer)
+{
+	say("hakios: idle: idle timer EXPIRED (the lock)\n");
+	((void (*)(id, SEL, id))o_px_expire)(self, sel, timer);
+}
+
+static void
+idle_px_warn(id self, SEL sel, id timer)
+{
+	say("hakios: idle: idle timer warned (the dim)\n");
+	((void (*)(id, SEL, id))o_px_warn)(self, sel, timer);
+}
+
+static void
+idle_hook1(const char *cls, const char *selector, IMP replacement, IMP *original)
+{
+	Class c = objc_getClass(cls);
+	Method m = c != Nil ? class_getInstanceMethod(c, sel_registerName(selector)) : NULL;
+
+	if (m == NULL) {
+		say("hakios: idle: -[%s %s] not found: not hooked\n", cls, selector);
+		return;
+	}
+	*original = method_getImplementation(m);
+	class_replaceMethod(c, sel_registerName(selector), replacement, method_getTypeEncoding(m));
+}
+
+static void
+idle_watch(int round)
+{
+	if (round == 0) {
+		idle_hook1("SBIdleTimerGlobalCoordinator", "_setIdleTimerWithDescriptor:forReason:", (IMP)idle_set_desc, &o_set_desc);
+		idle_hook1("SBIdleTimerGlobalCoordinator", "acquireIdleTimerDisableAssertionForReason:", (IMP)idle_acquire, &o_acquire);
+		idle_hook1("SBIdleTimerGlobalCoordinator", "_setIdleTimerSourceEnabled:forReason:", (IMP)idle_src_enabled, &o_src_enabled);
+		idle_hook1("SBIdleTimerGlobalCoordinator", "resetIdleTimerForReason:", (IMP)idle_reset_reason, &o_reset_reason);
+		idle_hook1("SBIdleTimerGlobalCoordinator", "resetIdleTimerIfNonConsecutiveSource:forReason:", (IMP)idle_reset_nc, &o_reset_nc);
+		idle_hook1("SBIdleTimerGlobalCoordinator", "resetIdleTimer", (IMP)idle_reset_plain, &o_reset_plain);
+		idle_hook1("SBBacklightIdleTimer", "idleTimerDidReset:forUserAttention:at:", (IMP)idle_bl_reset_att, &o_bl_reset_att);
+		idle_hook1("SBBacklightIdleTimer", "setDescriptor:", (IMP)idle_bl_set_desc, &o_bl_set_desc);
+		idle_hook1("SBBacklightIdleTimer", "idleTimer:attentionLostTimeoutDidExpire:", (IMP)idle_bl_att_lost, &o_bl_att_lost);
+		idle_hook1("SBIdleTimerProxy", "idleTimerDidExpire:", (IMP)idle_px_expire, &o_px_expire);
+		idle_hook1("SBIdleTimerProxy", "idleTimerDidWarn:", (IMP)idle_px_warn, &o_px_warn);
+		say("hakios: idle: SpringBoard's idle timer watched\n");
+	}
+	Class gc = objc_getClass("SBIdleTimerGlobalCoordinator");
+	id g = gc != Nil ? ((id (*)(Class, SEL))objc_msgSend)(gc, sel_registerName("sharedInstance")) : nil;
+	if (g != nil) {
+		SEL has = sel_registerName("_hasIdleTimerDisableAssertions"), list = sel_registerName("_idleTimerDisableAssertions"),
+		    timer = sel_registerName("idleTimer");
+		char a[400], t[300];
+		BOOL h = class_respondsToSelector(object_getClass(g), has) ? ((BOOL (*)(id, SEL))objc_msgSend)(g, has) : NO;
+		id l = class_respondsToSelector(object_getClass(g), list) ? ((id (*)(id, SEL))objc_msgSend)(g, list) : nil;
+		id it = class_respondsToSelector(object_getClass(g), timer) ? ((id (*)(id, SEL))objc_msgSend)(g, timer) : nil;
+
+		say("hakios: idle: %us: disable assertions %s: %s; timer %s; resets so far %u, for user attention %u\n", round * 10,
+		    h ? "YES" : "no", idle_text(l, a, sizeof(a)), idle_text(it, t, sizeof(t)), idle_resets, idle_att_resets);
+	}
+	if (round < 60) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+			idle_watch(round + 1);
+		});
+	}
+}
+
 static void
 bt_watch(int round)
 {
 	cc_bt_hook();
+	if (round == 0) {
+		idle_watch(0);
+	}
 	static char last[160];
 	char line[160];
 	Class bm = objc_getClass("BluetoothManager");
