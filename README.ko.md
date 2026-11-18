@@ -1,6 +1,6 @@
 # 이 포크: 갤럭시 노트9 (`crownlte`, SM-N960N) 실기기 구동
 
-> English: [README.md](README.md) (맨 아래 "This fork" 부분)
+> English: [README.md](README.md) (맨 위 "This fork" 부분). 원본 Scion 설명은 README.md에서 이 포크 설명 아래에 그대로 있어요.
 
 원본 README에는 노트9가 "작성만 됐고 실행된 적 없음"으로 적혀 있어요. 이 포크의 `note9` 브랜치에서는 **실제로 동작해요.**
 - 한국판 갤럭시 노트9 SM-N960N(Exynos 9810)에서 scion-installer의 TWRP 설치 파일로 iOS 16.5가 부팅되고, 매일 테스트에 쓰고 있어요.
