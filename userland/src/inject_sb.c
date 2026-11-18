@@ -926,9 +926,35 @@ idle_who(const char *what)
 	say("hakios: idle: %s call %u from:%s\n", what, calls, line);
 }
 
+/*
+ * Step 105 found who: -[SBTelephonyManager _handleTelephonyDaemonRestart] -> handleCallControlFailure: -> updateCalls ->
+ * resetIdleTimer, once a second for the whole run. There is no CommCenter here (no cellular: launchd's "failed lookup:
+ * com.apple.commcenter.xpc ... No such process" for SpringBoard), so SpringBoard takes the telephony daemon for restarting,
+ * tries again a second later, and every try resets the idle timer: the auto-lock never comes. The tries go on as they
+ * did; only the idle-timer reset made from inside one is not passed on (a real call cannot happen without CommCenter).
+ */
+static IMP o_tel_restart;
+static __thread bool in_tel_restart;
+static unsigned tel_resets_dropped;
+
+static void
+idle_tel_restart(id self, SEL sel, id arg)
+{
+	in_tel_restart = true;
+	((void (*)(id, SEL, id))o_tel_restart)(self, sel, arg);
+	in_tel_restart = false;
+}
+
 static void
 idle_reset_plain(id self, SEL sel)
 {
+	if (in_tel_restart) {
+		if (tel_resets_dropped++ < 3 || tel_resets_dropped % 300 == 0) {
+			say("hakios: idle: reset #%u from SBTelephonyManager's retry for a CommCenter that is not there: not passed on\n",
+			    tel_resets_dropped);
+		}
+		return;
+	}
 	idle_who("resetIdleTimer");
 	idle_count_reset("resetIdleTimer", nil);
 	((void (*)(id, SEL))o_reset_plain)(self, sel);
@@ -1004,6 +1030,7 @@ idle_watch(int round)
 		idle_hook1("SBBacklightIdleTimer", "idleTimer:attentionLostTimeoutDidExpire:", (IMP)idle_bl_att_lost, &o_bl_att_lost);
 		idle_hook1("SBIdleTimerProxy", "idleTimerDidExpire:", (IMP)idle_px_expire, &o_px_expire);
 		idle_hook1("SBIdleTimerProxy", "idleTimerDidWarn:", (IMP)idle_px_warn, &o_px_warn);
+		idle_hook1("SBTelephonyManager", "_handleTelephonyDaemonRestart", (IMP)idle_tel_restart, &o_tel_restart);
 		say("hakios: idle: SpringBoard's idle timer watched\n");
 	}
 	Class gc = objc_getClass("SBIdleTimerGlobalCoordinator");
@@ -1016,8 +1043,9 @@ idle_watch(int round)
 		id l = class_respondsToSelector(object_getClass(g), list) ? ((id (*)(id, SEL))objc_msgSend)(g, list) : nil;
 		id it = class_respondsToSelector(object_getClass(g), timer) ? ((id (*)(id, SEL))objc_msgSend)(g, timer) : nil;
 
-		say("hakios: idle: %us: disable assertions %s: %s; timer %s; resets so far %u, for user attention %u\n", round * 10,
-		    h ? "YES" : "no", idle_text(l, a, sizeof(a)), idle_text(it, t, sizeof(t)), idle_resets, idle_att_resets);
+		say("hakios: idle: %us: disable assertions %s: %s; timer %s; resets so far %u, for user attention %u, telephony's dropped %u\n",
+		    round * 10, h ? "YES" : "no", idle_text(l, a, sizeof(a)), idle_text(it, t, sizeof(t)), idle_resets, idle_att_resets,
+		    tel_resets_dropped);
 	}
 	if (round < 60) {
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
