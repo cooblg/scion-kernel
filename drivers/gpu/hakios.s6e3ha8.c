@@ -272,7 +272,7 @@ rx_pop(uint32_t *word, uint64_t us)
 static bool
 dsim_read(uint8_t reg, uint8_t *buf, uint32_t len)
 {
-	uint32_t word = 0, first = 0, got = 0, words = 0, stale = 0, intsrc;
+	uint32_t word = 0, first = 0, got = 0, words = 0, stale = 0, intsrc, ack_error = 0;
 	const char *why = NULL;
 	uint64_t deadline;
 
@@ -291,15 +291,19 @@ dsim_read(uint8_t reg, uint8_t *buf, uint32_t len)
 	}
 	/* (an answer in the FIFO is read even without RX data done: whether INTSRC shows that bit while it is masked is
 	 * for the phone to say) */
-	while (why == NULL && words < RX_WORDS && rx_pop(&word, words == 0 ? 1000 : 0)) {
+	/*
+	 * (step 107: the panel's answer came as an acknowledge-and-error report first -- 0x02, errors 0x3080 -- and its data a
+	 * moment later; the FIFO looked empty in between, the read gave up as "another length", and the data was left in the
+	 * FIFO for the next read to take as its own: values shifted one read along. After a report, the data is waited for,
+	 * and the report alone no longer fails a read that does get its data)
+	 */
+	while (why == NULL && words < RX_WORDS && got == 0 && rx_pop(&word, words == 0 || (first & 0xff) == RX_ACK_ERROR ? 1000 : 0)) {
 		uint32_t size;
 
 		first = words++ == 0 ? word : first;
 		switch (word & 0xff) {
 		case RX_ACK_ERROR:
-			if ((word >> 8) & RX_ERRORS) {
-				why = "the panel reported an error";
-			}
+			ack_error = (word >> 8) & 0xffff;
 			break;
 		case RX_EOT:
 			break;
@@ -335,7 +339,14 @@ dsim_read(uint8_t reg, uint8_t *buf, uint32_t len)
 		}
 	}
 	if (why == NULL && got != len) {
-		why = words == 0 ? "no answer" : "an answer of another length";
+		why = words == 0 ? "no answer" : ack_error != 0 ? "only the panel's error report" : "an answer of another length";
+	}
+	if (ack_error != 0 && why == NULL) {
+		static unsigned said_ack;
+
+		if (said_ack++ < 4) {
+			say("s6e3ha8: read %02X: the panel's error report %04x came first; its data followed and was taken\n", reg, ack_error);
+		}
 	}
 out:
 	intsrc = rd(DSIM_INTSRC);
