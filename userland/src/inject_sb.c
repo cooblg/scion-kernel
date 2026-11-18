@@ -37,6 +37,9 @@
  *     that have no window (chronod's, where the home screen's widgets are drawn: rc.jobs.widgets).
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <execinfo.h>
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
 #include <time.h>
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
@@ -862,7 +865,8 @@ idle_count_reset(const char *how, id reason)
 	char b[96];
 
 	idle_text(reason, b, sizeof(b));
-	if (idle_resets++ < 20 || strcmp(b, idle_last_reason) != 0) {
+	if (idle_resets++ < 20 || idle_resets % 100 == 0 || (strcmp(b, idle_last_reason) != 0 && strcmp(b, "IdleTimerReset") != 0 &&
+	    strcmp(b, "(nil)") != 0)) {
 		say("hakios: idle: reset #%u (%s) for: %s\n", idle_resets, how, b);
 	}
 	strlcpy(idle_last_reason, b, sizeof(idle_last_reason));
@@ -882,9 +886,50 @@ idle_reset_nc(id self, SEL sel, id source, id reason)
 	((void (*)(id, SEL, id, id))o_reset_nc)(self, sel, source, reason);
 }
 
+/*
+ * Step 104: resetIdleTimer (no reason) about once a second for the whole run, from boot -- the timer never reaches its 20 s
+ * warn. Who calls it: the return addresses of the first calls (and one in 30 after), each with its image and its
+ * address in the shared cache as built (unslid: the image's header is at its unslid address less the slide), to be
+ * named offline (dsc-tools objc.py).
+ */
+static void
+idle_who(const char *what)
+{
+	static unsigned calls;
+	void *frames[8];
+	int n;
+	char line[700];
+	size_t at = 0;
+
+	if (!(calls++ < 12 || calls % 30 == 0)) {
+		return;
+	}
+	n = backtrace(frames, 8);
+	for (int i = 2; i < n && at + 90 < sizeof(line); i++) {
+		Dl_info info;
+		const char *image = "?";
+		uintptr_t unslid = (uintptr_t)frames[i];
+
+		if (dladdr(frames[i], &info) != 0 && info.dli_fname != NULL) {
+			const char *slash = strrchr(info.dli_fname, '/');
+
+			image = slash != NULL ? slash + 1 : info.dli_fname;
+			for (uint32_t k = 0; k < _dyld_image_count(); k++) {
+				if (_dyld_get_image_header(k) == info.dli_fbase) {
+					unslid = (uintptr_t)frames[i] - (uintptr_t)_dyld_get_image_vmaddr_slide(k);
+					break;
+				}
+			}
+		}
+		at += (size_t)snprintf(line + at, sizeof(line) - at, " %s:0x%lx", image, (unsigned long)unslid);
+	}
+	say("hakios: idle: %s call %u from:%s\n", what, calls, line);
+}
+
 static void
 idle_reset_plain(id self, SEL sel)
 {
+	idle_who("resetIdleTimer");
 	idle_count_reset("resetIdleTimer", nil);
 	((void (*)(id, SEL))o_reset_plain)(self, sel);
 }
