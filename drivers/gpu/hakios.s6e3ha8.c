@@ -103,6 +103,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_time.h>
 #include <mach/mach_types.h>
@@ -707,7 +708,8 @@ static int panel_restore_all;
  * this panel is not to be woken from a sleep-in without a reset. The pin: crown26.dts's panel_drv gpio,lcd-reset =
  * <gpa3 4 active-low>, gpa3 of ALIVE's GPIO at 0x14050000 + 0x080 (as hakios.w9018.c reads its pins there).
  */
-static int panel_reset_mode = 0;      /* (off again in step 102: in step 101 the panel did not come back out of the reset -- black until reboot) */
+static int panel_reset_mode = 1;      /* (off in step 102 after step 101's black wake; on again in step 103 with the DSIM's lanes
+                                         in LP-11 over the reset, disp_det watched, retries, and the loader if all fail) */
 static bool panel_was_reset;
 static vm_offset_t alive_gpio;
 SYSCTL_INT(_kern_hakios, OID_AUTO, panel_reset, CTLFLAG_RW | CTLFLAG_LOCKED, &panel_reset_mode, 0,
@@ -747,6 +749,120 @@ panel_reset_line(int high)
 	}
 	return true;
 }
+/*
+ * Step 101's wake out of the reset left the panel black: the reset line went high with the DSIM running as ever, its
+ * clock lane in HS. Samsung's (dsim_drv.c of the 9810 kernel, _dsim_enable, which TWRP's kernel runs at every unblank)
+ * brings the panel out of reset with the D-PHY held in reset and then sets the link up again, so that the lanes are in
+ * LP-11 (stop state) when the panel's receiver starts, and only then sends the init; its suspend (_dsim_disable) takes
+ * the clock lane out of HS (dsim_reg_stop) before the reset line goes low. Here the clock lane is taken to LP and its
+ * stop state waited for around the reset, and back to HS before the init. DSIM_CLK_CTRL / DSIM_DPHY_STATUS: regs-dsim.h.
+ */
+#define DSIM_DPHY_STATUS        0x1C
+#define  TX_READY_HS_CLK        (1u << 10)
+#define  STOP_STATE_CLK         (1u << 8)
+#define  STOP_STATE_DAT         0xFu
+#define DSIM_CLK_CTRL           0x20
+#define  NONCONT_CLOCK_LANE     (1u << 25)
+#define  TX_REQUEST_HSCLK       (1u << 20)
+
+/* the clock lane in HS (on) or back in LP with every lane in its stop state (off): true when the D-PHY says so in 5 ms */
+static bool
+dsim_hs_clock(bool on)
+{
+	uint32_t c = rd(DSIM_CLK_CTRL);
+	uint64_t deadline = deadline_us(5000);
+
+	if (on) {
+		wr(DSIM_CLK_CTRL, c | TX_REQUEST_HSCLK);
+		if (c & NONCONT_CLOCK_LANE) {
+			return true;
+		}
+		while (!(rd(DSIM_DPHY_STATUS) & TX_READY_HS_CLK) && mach_absolute_time() < deadline) {
+		}
+		return (rd(DSIM_DPHY_STATUS) & TX_READY_HS_CLK) != 0;
+	}
+	wr(DSIM_CLK_CTRL, c & ~TX_REQUEST_HSCLK);
+	while ((rd(DSIM_DPHY_STATUS) & (STOP_STATE_CLK | STOP_STATE_DAT)) != (STOP_STATE_CLK | STOP_STATE_DAT) &&
+	    mach_absolute_time() < deadline) {
+	}
+	return (rd(DSIM_DPHY_STATUS) & STOP_STATE_CLK) != 0;
+}
+
+/*
+ * The panel's disp_det: high while it runs (crown26.dts panel_drv gpio,disp-det = <gpg2 2>, gpg2 the seventh bank of
+ * pinctrl@10430000: CON 0x0C0, DAT 0x0C4). Samsung's __panel_seq_init waits up to 200 x 100 us after its init for it to
+ * go high and, if it does not, powers the panel off, waits 100 ms and tries again (panel_sleep_out, up to 30 times).
+ * -1: not mapped. disp_det_on: what it read with the panel on, before its first sleep (only a 1 there makes it a test).
+ */
+#define DISP_DET_GPIO_PA        0x10430000UL
+#define GPG2_CON                0x0C0
+#define GPG2_DAT                0x0C4
+#define DISP_DET_PIN            2
+
+static vm_offset_t disp_det_gpio;
+static int disp_det_on = -1;
+
+static int
+panel_disp_det(void)
+{
+	static bool said;
+
+	if (disp_det_gpio == 0) {
+		disp_det_gpio = ml_io_map(DISP_DET_GPIO_PA, 0x1000);
+	}
+	if (disp_det_gpio == 0) {
+		return -1;
+	}
+	uint32_t con = *(volatile uint32_t *)(disp_det_gpio + GPG2_CON), dat = *(volatile uint32_t *)(disp_det_gpio + GPG2_DAT);
+
+	if (!said) {
+		said = true;
+		say("s6e3ha8: disp_det (gpg2-2): CON %08x (function %x), DAT %02x\n", con, (con >> (4 * DISP_DET_PIN)) & 0xf,
+		    dat & 0xff);
+	}
+	return (int)((dat >> DISP_DET_PIN) & 1);
+}
+
+/* panel_lock held (let go over the waits): out of the reset, the lanes in LP-11 as it starts. True when it answers 0A. */
+static bool
+panel_out_of_reset(int attempt)
+{
+	uint32_t cc0 = rd(DSIM_CLK_CTRL), st0 = rd(DSIM_DPHY_STATUS), st1;
+	bool lp = dsim_hs_clock(false), hs;
+	int det0 = panel_disp_det(), det1;
+	uint8_t pm = 0xff;
+	bool answered;
+
+	st1 = rd(DSIM_DPHY_STATUS);
+	(void)panel_reset_line(1);
+	lck_mtx_unlock(panel_lock);
+	delay(10 * 1000);               /* (Samsung: the reset high, 5 ms, then its init's own 5 ms) */
+	lck_mtx_lock(panel_lock);
+	det1 = panel_disp_det();
+	hs = dsim_hs_clock(true);
+	lck_mtx_unlock(panel_lock);
+	delay(5 * 1000);
+	lck_mtx_lock(panel_lock);
+	answered = panel_read(0x0A, &pm, 1);
+	say("s6e3ha8: wake %d out of reset: CLK_CTRL %08x, DPHY_STATUS %08x -> LP %s (%08x); disp_det in reset %d, 10 ms out %d; "
+	    "HS %s (%08x); 0A %s%02x\n", attempt, cc0, st0, lp ? "ok" : "NOT IN STOP STATE", st1, det0, det1, hs ? "ok" : "NOT READY",
+	    rd(DSIM_DPHY_STATUS), answered ? "" : "(NO ANSWER) ", pm);
+	return answered;
+}
+
+/* the run handed back to the loader -- as the five fingers do -- when the panel did not come back: the log kept */
+extern void loader_return(void);
+extern void hakios_var_save_on_return(void);
+
+static void
+panel_give_up(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	delay(3 * 1000 * 1000);
+	say("\n--- s6e3ha8: the panel did not come back out of its reset: back to the loader (the log kept) ---\n");
+	hakios_var_save_on_return();
+	loader_return();
+}
+
 SYSCTL_INT(_kern_hakios, OID_AUTO, panel_restore, CTLFLAG_RW | CTLFLAG_LOCKED, &panel_restore_all, 0,
     "a wake sends the mode, DSC/PPS, TE and the boot loader's registers again (1) or only sleep-out and 29 (0)");
 
@@ -853,14 +969,14 @@ panel_display(int on)
 	lck_mtx_lock(panel_lock);
 	/* what the panel says of itself, before and 30 ms after: DCS 0A (power mode: bit 2 display on, bit 3 normal mode,
 	   bit 4 sleep out) and 0D (display mode): whether 28 changed anything there */
-	read_before = panel_read(0x0A, &before, 1) && panel_read(0x0D, &mode_before, 1);
+	read_before = !(on && panel_was_reset) && panel_read(0x0A, &before, 1) && panel_read(0x0D, &mode_before, 1);
 	/*
 	 * DCS 05 (get_error_count_on_DSI: bit 7 overflow, bits 6-0 the count of DSI errors the panel has seen since it was last
 	 * read): before this change (the errors over the time the screen was on) and after it. With sleep-in the woken panel
 	 * shows black lines (steps 89-93), without it none (step 94): whether the link itself fails after a wake.
 	 */
 	uint8_t dsi_errors_before = 0xff, dsi_errors_after = 0xff;
-	bool errors_read_before = panel_read(0x05, &dsi_errors_before, 1);
+	bool errors_read_before = !(on && panel_was_reset) && panel_read(0x05, &dsi_errors_before, 1);
 	/*
 	 * Display-off alone (28) left the panel faintly lit (14-15 November: the screen grey-black, not off): its circuits
 	 * stay up. Off is now 28 then sleep-in (10), as Samsung's suspend sends them; on is sleep-out (11), its 120 ms, what
@@ -872,15 +988,14 @@ panel_display(int on)
 		lck_mtx_unlock(panel_lock);
 		hakios_scanout_hold(1);
 		lck_mtx_lock(panel_lock);
-		bool full = panel_restore_all || panel_was_reset;
+		bool full = panel_restore_all || panel_was_reset, was_reset = panel_was_reset, alive = true;
+		bool dsc = true, restored = true, put = true;
 
-		if (panel_was_reset) {
-			(void)panel_reset_line(1);
-			lck_mtx_unlock(panel_lock);
-			delay(15 * 1000);       /* (out of reset: Samsung's panel_reset waits about 10 ms, then 5 before its init) */
-			lck_mtx_lock(panel_lock);
-		}
-		bool dsc = full ? panel_dsc() : true;
+		/* (out of the reset, Samsung's way, up to three times: back into it for 100 ms when the panel did not come up) */
+		for (int attempt = 1; ; attempt++) {
+		bool answered = was_reset ? panel_out_of_reset(attempt) : true;
+
+		dsc = full ? panel_dsc() : true;
 
 		/* (the sleep-out whatever became of the DSC packets: a panel left asleep is worse than one decoding badly) */
 		ok = dsim_send(key_on, sizeof(key_on)) && dsim_send(sleep_out, 1);
@@ -889,8 +1004,35 @@ panel_display(int on)
 		lck_mtx_unlock(panel_lock);
 		delay(120 * 1000);              /* the sleep-out's own wait before the next command */
 		lck_mtx_lock(panel_lock);
-		bool restored = full ? panel_restore() : true;
-		bool put = full ? panel_regs_put() : true;      /* (after panel_restore: the boot loader's scaler wins) */
+		restored = full ? panel_restore() : true;
+		put = full ? panel_regs_put() : true;      /* (after panel_restore: the boot loader's scaler wins) */
+		if (!was_reset) {
+			break;
+		}
+		{
+			int det = panel_disp_det();
+			uint8_t pm = 0xff;
+
+			for (int i = 0; i < 200 && det == 0; i++) {     /* Samsung's 200 x 100 us */
+				delay(100);
+				det = panel_disp_det();
+			}
+			bool read = panel_read(0x0A, &pm, 1);
+
+			alive = answered && read && (pm & 0x10) && (disp_det_on != 1 || det == 1);
+			say("s6e3ha8: wake %d after the init: disp_det %d (on before the sleep: %d), 0A %s%02x (sleep-out bit %s): %s\n",
+			    attempt, det, disp_det_on, read ? "" : "(NO ANSWER) ", pm, (pm & 0x10) ? "set" : "NOT SET",
+			    alive ? "the panel is up" : attempt < 3 ? "NOT UP: back into reset for 100 ms" : "NOT UP, three times");
+		}
+		if (alive || attempt >= 3) {
+			break;
+		}
+		(void)dsim_hs_clock(false);
+		(void)panel_reset_line(0);
+		lck_mtx_unlock(panel_lock);
+		delay(100 * 1000);
+		lck_mtx_lock(panel_lock);
+		}
 
 		ok = restored && ok;
 		/* the brightness again (panel_set takes the lock itself) */
@@ -914,9 +1056,20 @@ panel_display(int on)
 		hakios_scanout_hold(0);
 		panel_asleep = false;
 		panel_was_reset = false;
+		if (!alive) {
+			static thread_call_t give_up;
+
+			panel_reset_mode = 0;   /* (the next sleeps without the reset, should the loader not take over) */
+			if (give_up == NULL) {
+				give_up = thread_call_allocate(panel_give_up, NULL);
+				if (give_up != NULL) {
+					(void)thread_call_enter(give_up);
+				}
+			}
+		}
 		say("s6e3ha8: woken (%s): DSC and PPS %s; scaler, CASET/PASET 1440x2960, SET_AREA, TE on %s; the boot loader's registers %s; "
-		    "brightness %d again (the last asked for)\n", panel_was_reset ? "out of reset: all set up again" : full ? "all restored" :
-		    "sleep-out and 29 only: nothing below sent",
+		    "brightness %d again (the last asked for)\n", was_reset ? (alive ? "out of reset: all set up again" :
+		    "out of reset: NOT UP, to the loader in 3 s") : full ? "all restored" : "sleep-out and 29 only: nothing below sent",
 		    dsc ? "sent" : "NOT SENT", restored ? "sent" : "NOT ALL SENT",
 		    !panel_regs_taken ? "not read" : put ? "written back" : "NOT ALL WRITTEN", panel_wanted);
 	} else if (!on && panel_sleep) {
@@ -924,6 +1077,8 @@ panel_display(int on)
 
 		if (!panel_regs_taken) {
 			panel_regs_take();      /* (the first sleep of the run: the panel still as the boot loader set it up) */
+			disp_det_on = panel_disp_det();
+			say("s6e3ha8: disp_det with the panel on: %d\n", disp_det_on);
 		}
 		/*
 		 * (no frame in flight while it is turned off and put to sleep; held until the wake has set it up again. "Asleep"
@@ -951,7 +1106,14 @@ panel_display(int on)
 			lck_mtx_unlock(panel_lock);
 			delay(100 * 1000);
 			lck_mtx_lock(panel_lock);
+			bool lp = dsim_hs_clock(false);     /* (Samsung's dsim_reg_stop: HS off before the reset goes low) */
+
 			panel_was_reset = panel_reset_line(0);
+			lck_mtx_unlock(panel_lock);
+			delay(5 * 1000);
+			lck_mtx_lock(panel_lock);
+			say("s6e3ha8: asleep in reset: clock lane to LP %s (DPHY_STATUS %08x), disp_det %d\n", lp ? "ok" : "NOT IN STOP STATE",
+			    rd(DSIM_DPHY_STATUS), panel_disp_det());
 		}
 	} else {
 		/* 28 or 29 alone (the default: a panel woken from sleep-in came back with black bands top and bottom, 15 Nov) */
