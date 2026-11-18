@@ -6,6 +6,7 @@
 !/.gitattributes
 !/VERSION
 !/README.md
+!/README.ko.md
 !/CONTRIBUTING.md
 !/CHANGELOG.md
 !/ci/
