@@ -14,6 +14,8 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <execinfo.h>
+#include <dlfcn.h>
+#include <Security/Security.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <signal.h>
@@ -50,8 +52,20 @@ killed(int number, siginfo_t *info, void *context)
 	(void)context;
 	k = snprintf(line, sizeof(line), "hakios: %s: SIGNAL %d at %p (the cache's slide %#lx), the stack:", who, number,
 	    info != NULL ? info->si_addr : NULL, (unsigned long)slide);
-	for (int i = 0; i < n && k < (int)sizeof(line) - 24; i++) {
-		k += snprintf(line + k, sizeof(line) - (size_t)k, " %#lx", (unsigned long)((uintptr_t)frames[i] - slide));
+	for (int i = 0; i < n && k < (int)sizeof(line) - 60; i++) {
+		Dl_info dl;
+		size_t cache = 0;
+		uintptr_t start = (uintptr_t)_dyld_get_shared_cache_range(&cache);
+
+		/* a frame in the shared cache as the cache's address; one in the app's own code as image+offset */
+		if ((uintptr_t)frames[i] - start < cache || dladdr(frames[i], &dl) == 0 || dl.dli_fname == NULL) {
+			k += snprintf(line + k, sizeof(line) - (size_t)k, " %#lx", (unsigned long)((uintptr_t)frames[i] - slide));
+		} else {
+			const char *base = strrchr(dl.dli_fname, '/');
+
+			k += snprintf(line + k, sizeof(line) - (size_t)k, " %s+%#lx", base != NULL ? base + 1 : dl.dli_fname,
+			    (unsigned long)((uintptr_t)frames[i] - (uintptr_t)dl.dli_fbase));
+		}
 	}
 	line[k++] = '\n';
 	say(line, (size_t)k);
@@ -314,6 +328,89 @@ watched_copy_path(id self, SEL cmd, id from, id to, id *error)
 	return file_said("copyItemAtPath", ok, from, to, error != NULL ? *error : mine);
 }
 
+/*
+ * The keychain (19 November): Instagram, installed with AppSync, logs in, dies (SIGTRAP) and asks to log in again; YouTube's
+ * Google sign-in goes nowhere. An app re-signed outside the App Store may not reach the keychain group its token is kept in
+ * (errSecMissingEntitlement -34018) or find its item gone. Every SecItem call that does not succeed is logged with its
+ * status and the item's class, service and access group; successes are counted.
+ */
+static unsigned keychain_ok, keychain_said;
+
+static void
+keychain_said_it(const char *call, OSStatus status, CFDictionaryRef query)
+{
+	char line[400], cls[48] = "-", svc[96] = "-", grp[96] = "-";
+	CFTypeRef v;
+
+	if (status == errSecSuccess) {
+		keychain_ok++;
+		return;
+	}
+	if (keychain_said++ >= 60) {
+		return;
+	}
+	if (query != NULL) {
+		if ((v = CFDictionaryGetValue(query, kSecClass)) != NULL && CFGetTypeID(v) == CFStringGetTypeID()) {
+			CFStringGetCString(v, cls, sizeof(cls), kCFStringEncodingUTF8);
+		}
+		if ((v = CFDictionaryGetValue(query, kSecAttrService)) != NULL && CFGetTypeID(v) == CFStringGetTypeID()) {
+			CFStringGetCString(v, svc, sizeof(svc), kCFStringEncodingUTF8);
+		}
+		if ((v = CFDictionaryGetValue(query, kSecAttrAccessGroup)) != NULL && CFGetTypeID(v) == CFStringGetTypeID()) {
+			CFStringGetCString(v, grp, sizeof(grp), kCFStringEncodingUTF8);
+		}
+	}
+	int n = snprintf(line, sizeof(line), "hakios: %s: keychain %s -> %d (class %s, service %s, group %s; %u succeeded so far)\n",
+	    who, call, (int)status, cls, svc, grp, keychain_ok);
+
+	say(line, (size_t)(n > 0 && n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
+}
+
+static OSStatus
+watched_item_add(CFDictionaryRef attributes, CFTypeRef *result)
+{
+	OSStatus status = SecItemAdd(attributes, result);
+
+	keychain_said_it("SecItemAdd", status, attributes);
+	return status;
+}
+
+static OSStatus
+watched_item_copy(CFDictionaryRef query, CFTypeRef *result)
+{
+	OSStatus status = SecItemCopyMatching(query, result);
+
+	keychain_said_it("SecItemCopyMatching", status, query);
+	return status;
+}
+
+static OSStatus
+watched_item_update(CFDictionaryRef query, CFDictionaryRef attributes)
+{
+	OSStatus status = SecItemUpdate(query, attributes);
+
+	keychain_said_it("SecItemUpdate", status, query);
+	return status;
+}
+
+static OSStatus
+watched_item_delete(CFDictionaryRef query)
+{
+	OSStatus status = SecItemDelete(query);
+
+	keychain_said_it("SecItemDelete", status, query);
+	return status;
+}
+
+__attribute__((used)) static struct {
+	const void *ours, *theirs;
+} keychain_interpose[] __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *)watched_item_add, (const void *)SecItemAdd },
+	{ (const void *)watched_item_copy, (const void *)SecItemCopyMatching },
+	{ (const void *)watched_item_update, (const void *)SecItemUpdate },
+	{ (const void *)watched_item_delete, (const void *)SecItemDelete },
+};
+
 __attribute__((used)) static struct {
 	const void *ours, *theirs;
 } spawn_interpose __attribute__((section("__DATA,__interpose"))) = {
@@ -365,6 +462,9 @@ hakios_app_init(void)
 	if (strcmp(name, "Sileo") == 0) {
 		dispatch_async(dispatch_get_main_queue(), ^{ keep_to_the_repositories(); });
 	}
+	if (strcmp(name, "Sileo") != 0) {
+		goto started;           /* (an App Store app: the signals and the keychain only; its network calls are many) */
+	}
 	watch("UIApplication", "beginBackgroundTaskWithExpirationHandler:", (IMP)watched_begin_task, &begin_task);
 	/*
 	 * NSURLSessionTask alone: its subclasses inherit the very same method, and watching it twice
@@ -375,6 +475,7 @@ hakios_app_init(void)
 	watch("NSFileManager", "copyItemAtURL:toURL:error:", (IMP)watched_copy_url, &copy_url);
 	watch("NSFileManager", "moveItemAtPath:toPath:error:", (IMP)watched_move_path, &move_path);
 	watch("NSFileManager", "copyItemAtPath:toPath:error:", (IMP)watched_copy_path, &copy_path);
+started:
 	n = snprintf(line, sizeof(line), "hakios: %s: started as uid %d (effective %d), watching for what kills it\n",
 	    name, (int)getuid(), (int)geteuid());
 	say(line, (size_t)(n > 0 ? n : 0));
