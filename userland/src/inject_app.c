@@ -17,6 +17,8 @@
 #include <dlfcn.h>
 #include <Security/Security.h>
 #include <sys/types.h>
+#include <sys/ucontext.h>
+#include <mach/mach.h>
 
 /* <sys/codesign.h>'s, not in the SDK's public headers */
 extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
@@ -62,7 +64,48 @@ killed(int number, siginfo_t *info, void *context)
 	char line[900];
 	int n = backtrace(frames, 32), k;
 
-	(void)context;
+	/*
+	 * Where it stopped and why (step 113: Instagram's SIGTRAP stayed at the same place with the keychain working): the
+	 * trapping instruction's image and offset, the instruction itself (brk #n: its number says whose trap), and the first
+	 * argument registers, each also read as a C string when it points at one (an assertion's message often is).
+	 */
+	if (context != NULL) {
+		ucontext_t *uc = (ucontext_t *)context;
+		uintptr_t pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+		Dl_info dl;
+		uint32_t insn = 0;
+		vm_size_t got = 0;
+		char where[160] = "?", regs[600];
+		int r = 0;
+
+		if (dladdr((void *)pc, &dl) != 0 && dl.dli_fname != NULL) {
+			const char *base = strrchr(dl.dli_fname, '/');
+
+			snprintf(where, sizeof(where), "%s+%#lx (%s)", base != NULL ? base + 1 : dl.dli_fname,
+			    (unsigned long)(pc - (uintptr_t)dl.dli_fbase), dl.dli_sname != NULL ? dl.dli_sname : "-");
+		}
+		(void)vm_read_overwrite(mach_task_self(), (vm_address_t)pc, 4, (vm_address_t)&insn, &got);
+		for (int i = 0; i < 4 && r < (int)sizeof(regs) - 140; i++) {
+			uint64_t x = uc->uc_mcontext->__ss.__x[i];
+			char str[100] = "";
+
+			if (x > 0x100000000ULL && vm_read_overwrite(mach_task_self(), (vm_address_t)x, sizeof(str) - 1,
+			    (vm_address_t)str, &got) == KERN_SUCCESS) {
+				str[sizeof(str) - 1] = 0;
+				for (char *q = str; *q; q++) {
+					if ((unsigned char)*q < 0x20 || (unsigned char)*q > 0x7e) {
+						*q = 0;
+						break;
+					}
+				}
+			}
+			r += snprintf(regs + r, sizeof(regs) - (size_t)r, " x%d=%#llx%s%s%s", i, (unsigned long long)x,
+			    strlen(str) >= 4 ? " \"" : "", strlen(str) >= 4 ? str : "", strlen(str) >= 4 ? "\"" : "");
+		}
+		k = snprintf(line, sizeof(line), "hakios: %s: SIGNAL %d stopped at %s, instruction %08x%s (brk #%u);%s\n", who,
+		    number, where, insn, (insn & 0xffe0001f) == 0xd4200000 ? "" : " (not a brk)", (insn >> 5) & 0xffff, regs);
+		say(line, (size_t)(k > 0 && k < (int)sizeof(line) ? k : (int)sizeof(line) - 1));
+	}
 	k = snprintf(line, sizeof(line), "hakios: %s: SIGNAL %d at %p (the cache's slide %#lx), the stack:", who, number,
 	    info != NULL ? info->si_addr : NULL, (unsigned long)slide);
 	for (int i = 0; i < n && k < (int)sizeof(line) - 60; i++) {
@@ -445,6 +488,33 @@ watched_item_delete(CFDictionaryRef query)
 	return status;
 }
 
+/*
+ * The errors an app makes (step 113: YouTube's Google sign-in still goes nowhere with the keychain working, and says
+ * nothing): every NSError made, its domain and code, the first 80 that are not URL cancellations.
+ */
+static id (*error_init)(id, SEL, id, long, id);
+static unsigned errors_said;
+
+static id
+watched_error_init(id self, SEL cmd, id domain, long code, id info)
+{
+	id made = error_init(self, cmd, domain, code, info);
+	const char *d = domain != nil ? ((const char *(*)(id, SEL))objc_msgSend)(domain, sel_registerName("UTF8String")) : "?";
+
+	if (d != NULL && !(strcmp(d, "NSURLErrorDomain") == 0 && code == -999) && errors_said < 80) {
+		char line[400];
+		id desc = info != nil ? ((id (*)(id, SEL, id))objc_msgSend)(info, sel_registerName("objectForKey:"),
+		    (id)CFSTR("NSLocalizedDescription")) : nil;
+		const char *t = desc != nil && ((BOOL (*)(id, SEL, Class))objc_msgSend)(desc, sel_registerName("isKindOfClass:"),
+		    objc_getClass("NSString")) ? ((const char *(*)(id, SEL))objc_msgSend)(desc, sel_registerName("UTF8String")) : "";
+		int n = snprintf(line, sizeof(line), "hakios: %s: NSError %s %ld %.200s\n", who, d, code, t != NULL ? t : "");
+
+		errors_said++;
+		say(line, (size_t)(n > 0 && n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
+	}
+	return made;
+}
+
 __attribute__((used)) static struct {
 	const void *ours, *theirs;
 } keychain_interpose[] __attribute__((section("__DATA,__interpose"))) = {
@@ -506,6 +576,7 @@ hakios_app_init(void)
 		dispatch_async(dispatch_get_main_queue(), ^{ keep_to_the_repositories(); });
 	}
 	if (strcmp(name, "Sileo") != 0) {
+		watch("NSError", "initWithDomain:code:userInfo:", (IMP)watched_error_init, &error_init);
 		goto started;           /* (an App Store app: the signals and the keychain only; its network calls are many) */
 	}
 	watch("UIApplication", "beginBackgroundTaskWithExpirationHandler:", (IMP)watched_begin_task, &begin_task);
