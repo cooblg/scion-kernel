@@ -1054,6 +1054,47 @@ idle_watch(int round)
 	}
 }
 
+/*
+ * Letterboxing (19 November): App Store apps (YouTube, Instagram) ran letterboxed at about 16:9 while the system apps and
+ * Sileo filled the screen. SpringBoard runs a third-party app in a "classic mode" (an older iPhone's screen, scaled into
+ * this one) unless the app says it supports this screen: -[SBApplication _classicModeFromSupportedTypes] (0: none, the
+ * whole screen; system apps and view services bypass it). No app knows this screen -- 1125x2313 is no iPhone's -- so every
+ * third-party app fell back to a 16:9 phone's. Every app gets "none" here: it lays itself out on the screen as it is, with
+ * the safe area the system apps get. What SpringBoard would have chosen is logged per app.
+ */
+static IMP o_classic_from_types;
+
+static long
+classic_none(id self, SEL sel)
+{
+	static unsigned said;
+	long was = ((long (*)(id, SEL))o_classic_from_types)(self, sel);
+
+	if (was != 0 && said++ < 40) {
+		id bid = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("bundleIdentifier"));
+		const char *b = bid != nil ? ((const char *(*)(id, SEL))objc_msgSend)(bid, sel_registerName("UTF8String")) : "?";
+
+		say("hakios: classic: %s would run in classic mode %ld (letterboxed): full screen instead\n", b ? b : "?", was);
+	}
+	return 0;
+}
+
+static void
+classic_hook(void)
+{
+	Class c = objc_getClass("SBApplication");
+	SEL sel = sel_registerName("_classicModeFromSupportedTypes");
+	Method m = c != Nil ? class_getInstanceMethod(c, sel) : NULL;
+
+	if (m == NULL) {
+		say("hakios: classic: -[SBApplication _classicModeFromSupportedTypes] not found: apps may run letterboxed\n");
+		return;
+	}
+	o_classic_from_types = method_getImplementation(m);
+	class_replaceMethod(c, sel, (IMP)classic_none, method_getTypeEncoding(m));
+	say("hakios: classic: SpringBoard's classic mode (letterboxing) off for every app (%s)\n", method_getTypeEncoding(m));
+}
+
 static void
 bt_watch(int round)
 {
@@ -3501,6 +3542,7 @@ hakios_springboard_init(void)
 	 * we are past UIApplication startup).
 	 */
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+		classic_hook();
 		Class uidev = objc_getClass("UIDevice");
 		SEL current = sel_registerName("currentDevice");
 		SEL monitoring = sel_registerName("setBatteryMonitoringEnabled:");
