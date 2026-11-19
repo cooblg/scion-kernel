@@ -1079,6 +1079,93 @@ classic_none(id self, SEL sel)
 	return 0;
 }
 
+/*
+ * View services for App Store apps (19 November): YouTube's Google sign-in sheet (SafariViewService, through
+ * ASWebAuthenticationSession) never opened -- FrontBoard refused the launch: FBSOpenApplicationErrorDomain 3, "Un-trusted
+ * clients may not open applications in the background". -[FBSystemService _isTrustedRequest:...] lets an app without the
+ * launch entitlements open another in the background only when the target's FBSApplicationInfo -hasViewServicesEntitlement
+ * (com.apple.UIKit.vends-view-services), and that is read from LaunchServices' record, which here has no entitlements for
+ * the system's apps. SafariViewService's own signature has the entitlement. A system application (under /Applications)
+ * that declares its view-service Mach service in its Info.plist (SBMachServices: com.apple.uikit.viewservice.<its id>, as
+ * every view service does) is taken for one.
+ */
+static IMP o_has_vs;
+
+static BOOL
+has_view_services(id self, SEL sel)
+{
+	static unsigned said;
+	BOOL has = ((BOOL (*)(id, SEL))o_has_vs)(self, sel);
+
+	if (has) {
+		return YES;
+	}
+	id bid = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("bundleIdentifier"));
+	id url = class_respondsToSelector(object_getClass(self), sel_registerName("bundleURL")) ?
+	    ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("bundleURL")) : nil;
+	const char *b = bid != nil ? ((const char *(*)(id, SEL))objc_msgSend)(bid, sel_registerName("UTF8String")) : NULL;
+	id path = url != nil ? ((id (*)(id, SEL))objc_msgSend)(url, sel_registerName("path")) : nil;
+	const char *pp = path != nil ? ((const char *(*)(id, SEL))objc_msgSend)(path, sel_registerName("UTF8String")) : NULL;
+
+	if (b == NULL || pp == NULL || strncmp(pp, "/Applications/", 14) != 0) {
+		return NO;
+	}
+	char want[256], plist[1100];
+
+	snprintf(want, sizeof(want), "com.apple.uikit.viewservice.%s", b);
+	snprintf(plist, sizeof(plist), "%s/Info.plist", pp);
+	CFURLRef purl = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)plist, (CFIndex)strlen(plist), false);
+	CFReadStreamRef rs = purl != NULL ? CFReadStreamCreateWithFile(NULL, purl) : NULL;
+	CFPropertyListRef info = NULL;
+	BOOL vends = NO;
+
+	if (rs != NULL && CFReadStreamOpen(rs)) {
+		info = CFPropertyListCreateWithStream(NULL, rs, 0, kCFPropertyListImmutable, NULL, NULL);
+		CFReadStreamClose(rs);
+	}
+	if (info != NULL && CFGetTypeID(info) == CFDictionaryGetTypeID()) {
+		CFArrayRef services = CFDictionaryGetValue(info, CFSTR("SBMachServices"));
+		CFStringRef w = CFStringCreateWithCString(NULL, want, kCFStringEncodingUTF8);
+
+		if (services != NULL && CFGetTypeID(services) == CFArrayGetTypeID() && w != NULL) {
+			vends = CFArrayContainsValue(services, CFRangeMake(0, CFArrayGetCount(services)), w);
+		}
+		if (w != NULL) {
+			CFRelease(w);
+		}
+	}
+	if (info != NULL) {
+		CFRelease(info);
+	}
+	if (rs != NULL) {
+		CFRelease(rs);
+	}
+	if (purl != NULL) {
+		CFRelease(purl);
+	}
+	if (vends && said++ < 20) {
+		say("hakios: viewservice: %s has no view-services entitlement in LaunchServices' record; its Info.plist names %s: "
+		    "taken for a view service\n", b, want);
+	}
+	return vends;
+}
+
+static void
+viewservice_hook(void)
+{
+	Class c = objc_getClass("FBSApplicationInfo");
+	SEL sel = sel_registerName("hasViewServicesEntitlement");
+	Method m = c != Nil ? class_getInstanceMethod(c, sel) : NULL;
+
+	if (m == NULL) {
+		say("hakios: viewservice: -[FBSApplicationInfo hasViewServicesEntitlement] not found\n");
+		return;
+	}
+	o_has_vs = method_getImplementation(m);
+	class_replaceMethod(c, sel, (IMP)has_view_services, method_getTypeEncoding(m));
+	say("hakios: viewservice: system view services open for App Store apps (%s)\n", method_getTypeEncoding(m));
+}
+
 static void
 classic_hook(void)
 {
@@ -3543,6 +3630,7 @@ hakios_springboard_init(void)
 	 */
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
 		classic_hook();
+		viewservice_hook();
 		Class uidev = objc_getClass("UIDevice");
 		SEL current = sel_registerName("currentDevice");
 		SEL monitoring = sel_registerName("setBatteryMonitoringEnabled:");
