@@ -511,6 +511,44 @@ watched_error_init(id self, SEL cmd, id domain, long code, id info)
 
 		errors_said++;
 		say(line, (size_t)(n > 0 && n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
+		/*
+		 * (step 115: YouTube's sign-in sheet is a view service that never starts -- _UIViewServiceInterfaceErrorDomain 0,
+		 * _UIViewServiceErrorDomain 1 -- and runningboardd is never asked to launch SafariViewService: what the error carries
+		 * and who made it)
+		 */
+		if (strstr(d, "ViewService") != NULL || strstr(d, "AuthenticationServices") != NULL || strstr(d, "WebAuthentication") != NULL ||
+		    strstr(d, "SafariServices") != NULL) {
+			id text = info != nil ? ((id (*)(id, SEL))objc_msgSend)(info, sel_registerName("description")) : nil;
+			const char *u = text != nil ? ((const char *(*)(id, SEL))objc_msgSend)(text, sel_registerName("UTF8String")) : "(none)";
+			char more[900];
+			void *frames[14];
+			int fn = backtrace(frames, 14), m;
+
+			m = snprintf(more, sizeof(more), "hakios: %s:   its userInfo: %.600s\n", who, u != NULL ? u : "?");
+			for (char *q = more + 20; *q && q < more + m - 1; q++) {
+				if (*q == '\n') {
+					*q = ' ';
+				}
+			}
+			say(more, (size_t)(m > 0 && m < (int)sizeof(more) ? m : (int)sizeof(more) - 1));
+			m = snprintf(more, sizeof(more), "hakios: %s:   made from:", who);
+			for (int i = 2; i < fn && m < (int)sizeof(more) - 60; i++) {
+				Dl_info dl;
+				size_t cache = 0;
+				uintptr_t start = (uintptr_t)_dyld_get_shared_cache_range(&cache);
+
+				if ((uintptr_t)frames[i] - start < cache || dladdr(frames[i], &dl) == 0 || dl.dli_fname == NULL) {
+					m += snprintf(more + m, sizeof(more) - (size_t)m, " %#lx", (unsigned long)((uintptr_t)frames[i] - slide));
+				} else {
+					const char *base = strrchr(dl.dli_fname, '/');
+
+					m += snprintf(more + m, sizeof(more) - (size_t)m, " %s+%#lx", base != NULL ? base + 1 : dl.dli_fname,
+					    (unsigned long)((uintptr_t)frames[i] - (uintptr_t)dl.dli_fbase));
+				}
+			}
+			more[m++] = '\n';
+			say(more, (size_t)m);
+		}
 	}
 	return made;
 }
