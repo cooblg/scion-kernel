@@ -16,7 +16,20 @@
 #include <execinfo.h>
 #include <dlfcn.h>
 #include <Security/Security.h>
+#include <sys/types.h>
+
+/* <sys/codesign.h>'s, not in the SDK's public headers */
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+#define CS_OPS_STATUS                   0
+#define CS_OPS_ENTITLEMENTS_BLOB        7
+#define CS_OPS_TEAMID                   14
+#define CS_OPS_DER_ENTITLEMENTS_BLOB    16
+#define CS_VALID                        0x00000001
+#define CS_DEBUGGED                     0x10000000
+#define CS_PLATFORM_BINARY              0x04000000
 #include <fcntl.h>
+#include <errno.h>
+#include <stdbool.h>
 #include <mach-o/dyld.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -366,6 +379,36 @@ keychain_said_it(const char *call, OSStatus status, CFDictionaryRef query)
 	say(line, (size_t)(n > 0 && n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
 }
 
+/*
+ * Why the keychain says -34018 (step 111: every call of Instagram's and YouTube's, none succeeded): the kernel gives a
+ * process's entitlements to securityd only while its signature is "valid" (CS_VALID or CS_DEBUGGED, bsd/kern/kern_proc.c's
+ * csops), and only those its signature carries. What this process has of both is said once at its start.
+ */
+static void
+signature_said(void)
+{
+	uint32_t flags = 0;
+	struct { uint32_t magic, length; } header = { 0, 0 };
+	char team[64] = "", line[400];
+	static char xml[16384];
+	int status = csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags));
+	int xml_rc = csops(getpid(), CS_OPS_ENTITLEMENTS_BLOB, xml, sizeof(xml));
+	int der_rc = csops(getpid(), CS_OPS_DER_ENTITLEMENTS_BLOB, &header, sizeof(header));
+	int der_errno = der_rc != 0 ? errno : 0;
+	int team_rc = csops(getpid(), CS_OPS_TEAMID, team, sizeof(team));
+	uint32_t xml_len = xml_rc == 0 ? __builtin_bswap32(((uint32_t *)xml)[1]) : 0;
+	const char *body = xml + 8;
+	bool groups = xml_rc == 0 && strstr(body, "keychain-access-groups") != NULL;
+	bool appid = xml_rc == 0 && strstr(body, "application-identifier") != NULL;
+	int n = snprintf(line, sizeof(line), "hakios: %s: code signature: csops status %d flags %#x (valid %d, debugged %d, platform %d); "
+	    "entitlements XML %s (%u bytes; keychain-access-groups %s, application-identifier %s), DER rc %d errno %d; team %s\n",
+	    who, status, flags, !!(flags & CS_VALID), !!(flags & CS_DEBUGGED), !!(flags & CS_PLATFORM_BINARY),
+	    xml_rc == 0 ? "read" : "NOT READ", xml_len, groups ? "yes" : "NO", appid ? "yes" : "NO", der_rc, der_errno,
+	    team_rc == 0 ? team + 8 : "(none)");
+
+	say(line, (size_t)(n > 0 && n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
+}
+
 static OSStatus
 watched_item_add(CFDictionaryRef attributes, CFTypeRef *result)
 {
@@ -476,6 +519,7 @@ hakios_app_init(void)
 	watch("NSFileManager", "moveItemAtPath:toPath:error:", (IMP)watched_move_path, &move_path);
 	watch("NSFileManager", "copyItemAtPath:toPath:error:", (IMP)watched_copy_path, &copy_path);
 started:
+	signature_said();
 	n = snprintf(line, sizeof(line), "hakios: %s: started as uid %d (effective %d), watching for what kills it\n",
 	    name, (int)getuid(), (int)geteuid());
 	say(line, (size_t)(n > 0 ? n : 0));
