@@ -516,7 +516,14 @@ watched_error_init(id self, SEL cmd, id domain, long code, id info)
 		 * _UIViewServiceErrorDomain 1 -- and runningboardd is never asked to launch SafariViewService: what the error carries
 		 * and who made it)
 		 */
-		if (strstr(d, "ViewService") != NULL || strstr(d, "AuthenticationServices") != NULL || strstr(d, "WebAuthentication") != NULL ||
+		/*
+		 * (step 117: Instagram still dies in IGLocalizedNextString right after "file not found" (NSCocoaErrorDomain 260,
+		 * NSPOSIXErrorDomain 2), a JSON that does not parse (3840) and OSStatus -10813: which file, which data)
+		 */
+		bool files = strcmp(who, "Instagram") == 0 && ((strcmp(d, "NSCocoaErrorDomain") == 0 && code != 4099) ||
+		    strcmp(d, "NSPOSIXErrorDomain") == 0 || strcmp(d, "NSOSStatusErrorDomain") == 0 || strncmp(d, "IG", 2) == 0);
+
+		if (files || strstr(d, "ViewService") != NULL || strstr(d, "AuthenticationServices") != NULL || strstr(d, "WebAuthentication") != NULL ||
 		    strstr(d, "SafariServices") != NULL) {
 			id text = info != nil ? ((id (*)(id, SEL))objc_msgSend)(info, sel_registerName("description")) : nil;
 			const char *u = text != nil ? ((const char *(*)(id, SEL))objc_msgSend)(text, sel_registerName("UTF8String")) : "(none)";
