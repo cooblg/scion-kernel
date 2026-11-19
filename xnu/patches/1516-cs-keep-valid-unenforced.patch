@@ -1,0 +1,59 @@
+diff -ru a/bsd/kern/kern_cs.c b/bsd/kern/kern_cs.c
+--- a/bsd/kern/kern_cs.c	2026-11-19 03:02:25
++++ b/bsd/kern/kern_cs.c	2026-11-19 03:02:39
+@@ -296,6 +296,25 @@
+ 		retval = 1;
+ 	}
+ 
++	/*
++	 * HakiOS (Scion, 19 November 2026): with signatures not enforced and neither CS_KILL nor CS_HARD, a page that does not
++	 * match its signature is allowed and the process stays valid (see mach_loader.c's initial pages): a decrypted app's
++	 * code pages never match, and losing CS_VALID loses its entitlements.
++	 */
++	if (!cs_process_global_enforcement() && (flags & (CS_KILL | CS_HARD)) == 0 && (flags & CS_VALID)) {
++		static int said;
++
++		proc_unlock(p);
++		if (said++ < 8) {
++			printf("CODE SIGNING: cs_invalid_page(0x%llx): p=%d[%s]: allowed, kept valid (signatures not enforced)\n",
++			    vaddr, proc_getpid(p), p->p_comm);
++		}
++		if (cs_killed) {
++			*cs_killed = FALSE;
++		}
++		return 0;
++	}
++
+ 	/* CS_HARD means fail the mapping operation so the process stays valid. */
+ 	if (flags & CS_HARD) {
+ 		retval = 1;
+diff -ru a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
+--- a/bsd/kern/mach_loader.c	2026-11-19 03:02:25
++++ b/bsd/kern/mach_loader.c	2026-11-19 03:02:39
+@@ -1330,8 +1330,25 @@
+ 							if (cs_process_global_enforcement() ||
+ 							    (result->csflags & (CS_HARD | CS_KILL | CS_ENFORCEMENT))) {
+ 								ret = LOAD_FAILURE;
++								result->csflags &= ~CS_VALID;
++							} else {
++								/*
++								 * HakiOS (Scion, Galaxy Note9, 19 November 2026): with signatures not enforced, a
++								 * page that does not match its signature no longer takes the signature's validity
++								 * away. A decrypted App Store app's header page never matches (its
++								 * LC_ENCRYPTION_INFO was changed), so such an app ran with csflags 0, and the
++								 * kernel kept its entitlements from securityd: every keychain call -34018
++								 * (Instagram, YouTube). The entitlements are the program's own as before
++								 * (miniamfi trusts the signature's list in any case).
++								 */
++								static int said;
++
++								if (said++ < 8) {
++									printf("CODE SIGNING: %s[%d]: initial page at offset %lld does not match its signature: "
++									    "kept valid (signatures not enforced)\n", vp->v_name, proc_getpid(p),
++									    (long long)(file_offset + off));
++								}
+ 							}
+-							result->csflags &= ~CS_VALID;
+ 						}
+ 						off += PAGE_SIZE;
+ 					}
